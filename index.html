@@ -1,0 +1,1319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Linear Scene Editor</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --border:#2a2f3a;
+    --text:#e8eaed; --sub:#8b93a3; --accent:#5b8cff; --accent2:#37e0a5;
+    --danger:#ff5c5c; --radius:10px;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  #app{display:flex; flex-direction:column; flex:1; min-height:0;}
+  header{
+    padding:10px 16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:16px; background:var(--panel);
+    flex-shrink:0;
+  }
+  header h1{font-size:15px; font-weight:600; margin:0; letter-spacing:.3px; white-space:nowrap;}
+  header .sep{width:1px; height:22px; background:var(--border);}
+  .dropzone{
+    flex:1; border:1.5px dashed var(--border); border-radius:8px; padding:8px 14px;
+    font-size:13px; color:var(--sub); display:flex; align-items:center; gap:10px;
+    cursor:pointer; transition:border-color .15s, color .15s;
+  }
+  .dropzone.drag{border-color:var(--accent); color:var(--text);}
+  .dropzone input[type=file]{display:none;}
+  .dropzone button{
+    background:var(--accent); border:none; color:#fff; padding:6px 12px; border-radius:6px;
+    font-size:12.5px; cursor:pointer; font-weight:600;
+  }
+  .dropzone .url-input{
+    background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    border-radius:6px; padding:6px 8px; font-size:12.5px; flex:1; min-width:120px;
+  }
+  .status{font-size:12px; color:var(--sub); white-space:nowrap;}
+  .status.busy{color:var(--accent2);}
+
+  .main{flex:1; display:flex; overflow:hidden; min-height:0;}
+
+  /* LEFT STACK */
+  .stack-panel{
+    width:280px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .stack-header{
+    padding:10px 12px; border-bottom:1px solid var(--border); font-size:12px;
+    color:var(--sub); text-transform:uppercase; letter-spacing:.6px;
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  .stack-list{flex:1; overflow-y:auto; padding:8px;}
+  .scene-card{
+    background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+    margin-bottom:8px; padding:8px; cursor:grab; display:flex; gap:8px;
+    align-items:center; transition:border-color .12s, transform .12s;
+  }
+  .scene-card.dragging{opacity:.35;}
+  .scene-card.dragover{border-color:var(--accent);}
+  .scene-card.active{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset;}
+  .scene-card.disabled{opacity:.4;}
+  .scene-card .thumb{
+    width:56px; height:32px; border-radius:4px; background:#000 center/cover no-repeat;
+    flex-shrink:0; border:1px solid var(--border);
+  }
+  .scene-card .meta{flex:1; min-width:0;}
+  .scene-card .meta .idx{font-size:11px; color:var(--sub);}
+  .scene-card .meta .dur{font-size:12.5px; font-weight:600;}
+  .scene-card .actions{display:flex; gap:4px; flex-shrink:0;}
+  .scene-card .actions button{
+    background:transparent; border:1px solid var(--border); color:var(--sub);
+    width:22px; height:22px; border-radius:5px; cursor:pointer; font-size:12px;
+    display:flex; align-items:center; justify-content:center; line-height:1;
+  }
+  .scene-card .actions button:hover{color:var(--text); border-color:var(--accent);}
+  .scene-card .actions button.off{color:var(--danger); border-color:var(--danger);}
+
+  .stack-footer{padding:10px 12px; border-top:1px solid var(--border); font-size:12px; color:var(--sub);}
+
+  /* CENTER PREVIEW */
+  .preview-panel{flex:1; display:flex; flex-direction:column; min-width:0; background:#000;}
+  .preview-stage{flex:1; display:flex; align-items:center; justify-content:center; position:relative; min-height:0; background:#000;}
+  .preview-stage video{max-width:100%; max-height:100%;}
+  .empty-hint{color:var(--sub); font-size:13px; text-align:center; padding:40px;}
+  .transport{
+    background:var(--panel); border-top:1px solid var(--border); padding:10px 16px;
+    display:flex; align-items:center; gap:12px; flex-shrink:0;
+  }
+  .transport button{
+    background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    width:34px; height:34px; border-radius:50%; cursor:pointer; font-size:14px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .transport button.play{background:var(--accent); border-color:var(--accent);}
+  .timeline-wrap{flex:1; display:flex; flex-direction:column; gap:3px;}
+  .timeline{position:relative; height:8px; background:var(--panel2); border-radius:4px; overflow:hidden; display:flex;}
+  .timeline .seg{height:100%; box-shadow:inset -1px 0 0 var(--bg); box-sizing:border-box;}
+  .timeline .seg:last-child{box-shadow:none;}
+  .timeline .seg.disabled{opacity:.25;}
+  .timeline .playhead{position:absolute; top:-3px; width:2px; height:14px; background:#fff; pointer-events:none;}
+  .timeline-labels{display:flex; justify-content:space-between; font-size:11px; color:var(--sub);}
+
+  /* RIGHT TRIM PANEL */
+  .trim-panel{
+    width:320px; flex-shrink:0; background:var(--panel); border-left:1px solid var(--border);
+    display:flex; flex-direction:column; overflow-y:auto;
+  }
+  .trim-header{padding:10px 12px; border-bottom:1px solid var(--border); font-size:12px; color:var(--sub); text-transform:uppercase; letter-spacing:.6px;}
+  .trim-body{padding:12px; display:flex; flex-direction:column; gap:14px;}
+  .trim-empty{padding:20px 12px; color:var(--sub); font-size:13px;}
+  .field label{font-size:11px; color:var(--sub); display:block; margin-bottom:4px;}
+  .field .val{font-size:13px; font-weight:600; font-variant-numeric:tabular-nums;}
+  .clip-preview{width:100%; border-radius:6px; background:#000; max-height:140px;}
+  .trim-track{
+    position:relative; height:44px; background:var(--panel2); border-radius:6px; overflow:hidden;
+    border:1px solid var(--border); cursor:pointer;
+  }
+  .trim-track .thumbs{position:absolute; inset:0; display:flex;}
+  .trim-track .thumbs img{height:100%; flex:1; object-fit:cover; opacity:.55;}
+  .trim-track .range{position:absolute; top:0; bottom:0; background:rgba(91,140,255,.28); border-left:2px solid var(--accent); border-right:2px solid var(--accent);}
+  .trim-track .handle{
+    position:absolute; top:0; bottom:0; width:10px; background:var(--accent); cursor:ew-resize;
+    display:flex; align-items:center; justify-content:center; border-radius:3px;
+  }
+  .trim-track .handle::after{content:''; width:2px; height:16px; background:#fff; opacity:.8; border-radius:1px;}
+  .trim-track .playhead2{position:absolute; top:-2px; bottom:-2px; width:2px; background:#fff;}
+  .trim-actions{display:flex; gap:8px;}
+  .trim-actions button{
+    flex:1; background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    padding:8px; border-radius:6px; font-size:12.5px; cursor:pointer;
+  }
+  .trim-actions button:hover{border-color:var(--accent);}
+  .trim-actions button.primary{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600;}
+
+  .fit-options{display:flex; gap:6px;}
+  .fit-btn{
+    flex:1; background:var(--panel2); border:1px solid var(--border); color:var(--sub);
+    padding:7px 4px; border-radius:6px; font-size:12px; cursor:pointer; text-transform:capitalize;
+  }
+  .fit-btn:hover{border-color:var(--accent); color:var(--text);}
+  .fit-btn.active{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600;}
+
+  .ratio-select{
+    background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    border-radius:6px; padding:6px 8px; font-size:12.5px; cursor:pointer;
+  }
+
+  .export-btn{
+    background:var(--accent2); border:none; color:#0a0f0c; padding:7px 14px; border-radius:6px;
+    font-size:12.5px; cursor:pointer; font-weight:700; white-space:nowrap;
+  }
+  .export-btn:disabled{opacity:.5; cursor:not-allowed;}
+
+  .speech-btn{
+    background:transparent; border:1px solid var(--accent); color:var(--accent); padding:7px 14px;
+    border-radius:6px; font-size:12.5px; cursor:pointer; font-weight:700; white-space:nowrap;
+  }
+  .speech-btn:hover:not(:disabled){background:var(--accent); color:#fff;}
+  .speech-btn:disabled{opacity:.5; cursor:not-allowed;}
+
+  ::-webkit-scrollbar{width:8px; height:8px;}
+  ::-webkit-scrollbar-thumb{background:var(--border); border-radius:4px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+
+  .progress-bar{
+    position:fixed; top:0; left:0; height:2px; background:var(--accent2); z-index:999;
+    transition:width .15s linear;
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/jsx-module" id="app-source">
+import { applyDiff, createElement, Fragment } from "https://esm.sh/webjsx@0.0.73";
+import createRNNWasmModuleSync from "https://cdn.jsdelivr.net/npm/@timephy/rnnoise-wasm@1.0.0/dist/generated/rnnoise-sync.js";
+import RnnoiseProcessor, { RNNOISE_SAMPLE_LENGTH } from "https://cdn.jsdelivr.net/npm/@timephy/rnnoise-wasm@1.0.0/dist/RnnoiseProcessor.js";
+
+/* ---------------- State ---------------- */
+
+const CANVAS_RATIOS = [
+  { id: "16:9", w: 16, h: 9, label: "16:9 Landscape" },
+  { id: "9:16", w: 9, h: 16, label: "9:16 Portrait" },
+  { id: "1:1", w: 1, h: 1, label: "1:1 Square" },
+  { id: "4:3", w: 4, h: 3, label: "4:3 Classic" },
+];
+
+const state = {
+  sources: [],          // {id, url, name, width, height} — one entry per loaded video file/URL
+  status: "Drop a video file or paste a URL to begin",
+  busy: false,
+  progress: 0,
+  scenes: [],          // {id, sourceId, start, end, enabled, thumb, fit}
+  order: [],           // array of scene ids, defines stack order
+  activeSceneId: null,
+  playingIndex: -1,    // index into enabledOrder during sequential playback
+  isPlaying: false,
+  dragId: null,
+  trimDragHandle: null, // 'in' | 'out' | null
+  canvasRatio: "16:9",
+  exporting: false,
+  exportProgress: 0,
+  speechScanning: false,
+  speechScanProgress: 0,
+};
+
+function canvasRatioValue() {
+  const r = CANVAS_RATIOS.find(r => r.id === state.canvasRatio) || CANVAS_RATIOS[0];
+  return r.w / r.h;
+}
+
+// A scene needs a fit control only when its source's aspect ratio doesn't already
+// match the output canvas — an exact match has nothing to crop/letterbox/stretch.
+function sceneNeedsFit(scene) {
+  const src = sourceFor(scene);
+  if (!src || !src.width || !src.height) return false;
+  const sceneRatio = src.width / src.height;
+  return Math.abs(sceneRatio - canvasRatioValue()) > 0.01;
+}
+
+let uid = 1;
+const nextId = () => uid++;
+
+function sourceFor(sceneOrId) {
+  const scene = typeof sceneOrId === "object" ? sceneOrId : state.scenes.find(s => s.id === sceneOrId);
+  return scene ? state.sources.find(src => src.id === scene.sourceId) : null;
+}
+
+/* ---------------- Offscreen helpers ---------------- */
+
+const offVideo = document.createElement("video");
+offVideo.muted = true;
+offVideo.playsInline = true;
+offVideo.preload = "auto";
+
+const offCanvas = document.createElement("canvas");
+const offCtx = offCanvas.getContext("2d", { willReadFrequently: true });
+
+function seekOff(t) {
+  return new Promise((resolve) => {
+    const onSeeked = () => {
+      offVideo.removeEventListener("seeked", onSeeked);
+      resolve();
+    };
+    offVideo.addEventListener("seeked", onSeeked);
+    offVideo.currentTime = t;
+  });
+}
+
+function grabFrameData(w, h) {
+  offCanvas.width = w;
+  offCanvas.height = h;
+  offCtx.drawImage(offVideo, 0, 0, w, h);
+  try {
+    return colorHistogram(offCtx.getImageData(0, 0, w, h).data);
+  } catch (e) {
+    if (e.name === "SecurityError") throw new TaintedCanvasError();
+    throw e;
+  }
+}
+
+class TaintedCanvasError extends Error {}
+
+const HIST_BINS = 16;
+
+function colorHistogram(data) {
+  // 3 channels x HIST_BINS bins, normalized to sum to 1 per channel. Histograms
+  // describe the overall color distribution of a frame while ignoring WHERE
+  // colors sit spatially — this makes the comparison robust to camera pans,
+  // handheld shake, and motion within a shot, which a raw per-pixel diff is not.
+  const hist = new Float32Array(HIST_BINS * 3);
+  const binWidth = 256 / HIST_BINS;
+  let count = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    hist[Math.min(HIST_BINS - 1, (data[i] / binWidth) | 0)]++;
+    hist[HIST_BINS + Math.min(HIST_BINS - 1, (data[i + 1] / binWidth) | 0)]++;
+    hist[HIST_BINS * 2 + Math.min(HIST_BINS - 1, (data[i + 2] / binWidth) | 0)]++;
+    count++;
+  }
+  for (let i = 0; i < hist.length; i++) hist[i] /= count;
+  return hist;
+}
+
+function frameDiff(a, b) {
+  // Sum of absolute differences between normalized histograms, scaled to be
+  // roughly comparable in magnitude to the old raw-pixel-diff thresholds.
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return sum * 100;
+}
+
+function thumbAt(t) {
+  return new Promise(async (resolve) => {
+    await seekOff(t);
+    const w = 160, h = Math.round(160 * (offVideo.videoHeight / offVideo.videoWidth || 0.5625));
+    offCanvas.width = w; offCanvas.height = h;
+    offCtx.drawImage(offVideo, 0, 0, w, h);
+    try {
+      resolve(offCanvas.toDataURL("image/jpeg", 0.6));
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+/* ---------------- Scene detection ---------------- */
+
+async function detectScenes(url, sourceId, sourceLabel) {
+  state.busy = true;
+  state.progress = 0;
+  state.status = `Loading ${sourceLabel}...`;
+  render();
+
+  offVideo.src = url;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out loading video (check the URL/CORS)")), 20000);
+    offVideo.onloadedmetadata = () => { clearTimeout(timer); resolve(); };
+    offVideo.onerror = () => { clearTimeout(timer); reject(new Error("Could not load video")); };
+  });
+
+  const duration = offVideo.duration;
+  const source = state.sources.find(s => s.id === sourceId);
+  if (source) {
+    source.width = offVideo.videoWidth;
+    source.height = offVideo.videoHeight;
+  }
+
+  const SAMPLE_FPS = 4; // samples per second for diffing
+  const sampleInterval = 1 / SAMPLE_FPS;
+  const totalSamples = Math.max(2, Math.floor(duration / sampleInterval));
+  const w = 96, h = Math.round(96 * (offVideo.videoHeight / offVideo.videoWidth || 0.5625));
+
+  let prevData = null;
+  let corsBlocked = false;
+  const samples = []; // {t, diff}
+
+  for (let i = 0; i < totalSamples; i++) {
+    const t = Math.min(duration - 0.02, i * sampleInterval);
+    await seekOff(t);
+    let data;
+    try {
+      data = grabFrameData(w, h);
+    } catch (e) {
+      if (e instanceof TaintedCanvasError) {
+        corsBlocked = true;
+        break;
+      }
+      throw e;
+    }
+    if (prevData) {
+      samples.push({ t, diff: frameDiff(prevData, data) });
+    }
+    prevData = data;
+    state.progress = Math.round(((i + 1) / totalSamples) * 100);
+    state.status = `Analyzing ${sourceLabel}... ${state.progress}%`;
+    if (i % 3 === 0) render();
+  }
+
+  let cutTimes = [0];
+
+  if (corsBlocked) {
+    // Source doesn't allow cross-origin pixel access (no CORS headers) — fall back
+    // to fixed-interval chunking so the editor still works, just without cut detection.
+    const CHUNK_LEN = 5;
+    for (let t = CHUNK_LEN; t < duration; t += CHUNK_LEN) cutTimes.push(t);
+  } else if (samples.length) {
+    // Adaptive thresholding: a real cut is a spike far above the LOCAL baseline
+    // (recent motion/lighting level), not just a high absolute diff value. This
+    // keeps continuous handheld/panning footage from being chopped into dozens
+    // of false "scenes" while still catching genuine hard cuts.
+    const WINDOW = 10; // samples of local history considered for the baseline
+    const MIN_ABS = 60; // floor below which nothing is ever considered a cut (compression noise lives well under this)
+    const SPIKE_MULT = 2.5; // must exceed baseline by this multiple
+    const recent = [];
+    for (const s of samples) {
+      // Use the MAX of recent history (not the mean) as baseline: a mean is dragged
+      // down by mostly-quiet frames, which lets a single noisy-but-non-cut frame
+      // look like a huge multiple of it. Max tracks "how noisy has it gotten lately".
+      const baseline = recent.length ? Math.max(...recent) : Infinity; // no history yet -> never auto-cut during warmup
+      const isCut = s.diff >= MIN_ABS && s.diff > baseline * SPIKE_MULT;
+      if (isCut) {
+        cutTimes.push(s.t);
+        recent.length = 0; // reset baseline after a cut so it isn't skewed by the jump
+      } else {
+        recent.push(s.diff);
+        if (recent.length > WINDOW) recent.shift();
+      }
+    }
+  }
+
+  cutTimes.push(duration);
+  // dedupe / enforce min scene length
+  const MIN_LEN = 1.2;
+  const cleaned = [cutTimes[0]];
+  for (let i = 1; i < cutTimes.length; i++) {
+    if (cutTimes[i] - cleaned[cleaned.length - 1] >= MIN_LEN) cleaned.push(cutTimes[i]);
+  }
+  if (cleaned[cleaned.length - 1] < duration - 0.01) cleaned.push(duration);
+
+  const scenes = [];
+  for (let i = 0; i < cleaned.length - 1; i++) {
+    const start = cleaned[i];
+    const end = cleaned[i + 1];
+    scenes.push({
+      id: nextId(),
+      sourceId,
+      start, end,
+      trimIn: start,
+      trimOut: end,
+      enabled: true,
+      thumb: null,
+      fit: "cover",
+    });
+  }
+
+  state.status = `Generating thumbnails for ${sourceLabel}...`;
+  render();
+
+  for (let i = 0; i < scenes.length; i++) {
+    const mid = scenes[i].start + Math.min(0.15, (scenes[i].end - scenes[i].start) / 3);
+    scenes[i].thumb = await thumbAt(mid);
+    state.progress = Math.round(((i + 1) / scenes.length) * 100);
+    render();
+  }
+
+  state.scenes = state.scenes.concat(scenes);
+  state.order = state.order.concat(scenes.map(s => s.id));
+  if (state.activeSceneId == null) state.activeSceneId = scenes[0] ? scenes[0].id : null;
+  state.busy = false;
+  state.status = corsBlocked
+    ? `${sourceLabel}: ${scenes.length} chunks (source blocks pixel analysis — split into 5s segments instead)`
+    : `${sourceLabel}: ${scenes.length} scenes detected (${state.scenes.length} total)`;
+  render();
+}
+
+/* ---------------- File / URL loading ---------------- */
+
+function addSource(url, name) {
+  const source = { id: nextId(), url, name };
+  state.sources.push(source);
+  return source;
+}
+
+function loadFile(file) {
+  if (!file || !file.type.startsWith("video/")) {
+    state.status = "Please provide a valid video file";
+    render();
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  const source = addSource(url, file.name);
+  detectScenes(url, source.id, file.name).catch(err => {
+    state.busy = false;
+    state.status = "Error: " + err.message;
+    render();
+  });
+}
+
+function loadURL(url) {
+  if (!url) return;
+  const name = url.split("/").pop().split("?")[0] || url;
+  const source = addSource(url, name);
+  detectScenes(url, source.id, name).catch(err => {
+    state.busy = false;
+    state.status = "Error: " + err.message;
+    render();
+  });
+}
+
+/* ---------------- Ordering / editing ---------------- */
+
+function orderedScenes() {
+  return state.order
+    .map(id => state.scenes.find(s => s.id === id))
+    .filter(Boolean);
+}
+
+function enabledOrderedScenes() {
+  return orderedScenes().filter(s => s.enabled);
+}
+
+function moveScene(dragId, dropId) {
+  if (dragId === dropId) return;
+  const order = state.order.slice();
+  const from = order.indexOf(dragId);
+  const to = order.indexOf(dropId);
+  if (from < 0 || to < 0) return;
+  order.splice(from, 1);
+  order.splice(to, 0, dragId);
+  state.order = order;
+  render();
+}
+
+function toggleScene(id) {
+  const s = state.scenes.find(s => s.id === id);
+  if (s) s.enabled = !s.enabled;
+  render();
+}
+
+function removeScene(id) {
+  state.scenes = state.scenes.filter(s => s.id !== id);
+  state.order = state.order.filter(x => x !== id);
+  if (state.activeSceneId === id) {
+    state.activeSceneId = state.order[0] || null;
+  }
+  render();
+}
+
+// Points <video id="mainVideo"> at the scene's source (swapping .src only when the
+// source actually differs, since a <video> reload drops playback position) and
+// resolves once it's safe to seek — immediately if no swap was needed, or after
+// loadedmetadata if it was. Scenes from different source files are stitched into
+// one linear sequence this way, one physical <video> element reused across them.
+//
+// The loaded source id is tracked as a DOM attribute on the element itself (not a
+// JS variable) because webjsx's diffing can replace the underlying <video> node
+// across renders (e.g. when the DOM tree structure changes elsewhere), silently
+// resetting .src to empty — a JS-side "currently loaded" variable would then be
+// stale and never notice the element lost its source.
+function ensureVideoSource(mainVideo, scene) {
+  const src = sourceFor(scene);
+  if (!src) return Promise.resolve();
+  if (mainVideo.dataset.loadedSourceId === String(src.id) && mainVideo.src) return Promise.resolve();
+  return new Promise((resolve) => {
+    mainVideo.src = src.url;
+    mainVideo.dataset.loadedSourceId = String(src.id);
+    mainVideo.onloadedmetadata = () => resolve();
+  });
+}
+
+function selectScene(id) {
+  state.activeSceneId = id;
+  state.isPlaying = false;
+  const s = state.scenes.find(s => s.id === id);
+  const mainVideo = document.getElementById("mainVideo");
+  if (s && mainVideo) {
+    mainVideo.pause();
+    ensureVideoSource(mainVideo, s).then(() => { mainVideo.currentTime = s.trimIn; });
+  }
+  render();
+}
+
+/* ---------------- Sequential playback ---------------- */
+
+function playFromStart() {
+  const list = enabledOrderedScenes();
+  if (!list.length) return;
+  state.isPlaying = true;
+  state.playingIndex = 0;
+  playCurrentSegment();
+}
+
+async function playCurrentSegment() {
+  const list = enabledOrderedScenes();
+  const scene = list[state.playingIndex];
+  const mainVideo = document.getElementById("mainVideo");
+  if (!scene || !mainVideo) { stopPlayback(); return; }
+  state.activeSceneId = scene.id;
+  await ensureVideoSource(mainVideo, scene);
+  if (!state.isPlaying) return; // stopped while the source was loading
+  mainVideo.currentTime = scene.trimIn;
+  mainVideo.play().catch(() => {
+    // e.g. AbortError from a backgrounded tab's power-saving pause — surface as
+    // stopped rather than leaving playback silently stuck mid-sequence.
+    if (state.isPlaying) stopPlayback();
+  });
+  render();
+}
+
+function onTimeUpdate() {
+  if (!state.isPlaying) return;
+  const list = enabledOrderedScenes();
+  const scene = list[state.playingIndex];
+  const mainVideo = document.getElementById("mainVideo");
+  if (!scene || !mainVideo) return;
+  if (mainVideo.currentTime >= scene.trimOut) {
+    state.playingIndex++;
+    if (state.playingIndex >= list.length) {
+      stopPlayback();
+    } else {
+      playCurrentSegment();
+    }
+  } else {
+    render();
+  }
+}
+
+function stopPlayback() {
+  state.isPlaying = false;
+  state.playingIndex = -1;
+  const mainVideo = document.getElementById("mainVideo");
+  if (mainVideo) mainVideo.pause();
+  render();
+}
+
+function togglePlay() {
+  if (state.isPlaying) {
+    stopPlayback();
+  } else {
+    playFromStart();
+  }
+}
+
+/* ---------------- Speech Only: re-cut scenes to remove non-vocal silence ---------------- */
+
+const SPEECH_DB_THRESHOLD = -14; // gate: below this on the denoised signal counts as non-speech
+const SPEECH_MIN_GAP = 0.3; // seconds — silence shorter than this is kept rather than cut
+const SPEECH_PAD = 0.15; // seconds of lead-in/lead-out padding added around each kept region
+
+// Decode a source URL's full audio track once (mono, resampled to RNNoise's
+// required 44100Hz) and cache it — multiple scenes on the same source clip
+// reuse this instead of re-decoding/re-running RNNoise per scene.
+const decodedAudioCache = new Map(); // sourceId -> Promise<Float32Array | null>
+
+async function decodeSourceAudioMono44100(source) {
+  if (decodedAudioCache.has(source.id)) return decodedAudioCache.get(source.id);
+
+  const promise = (async () => {
+    const resp = await fetch(source.url);
+    const arrayBuffer = await resp.arrayBuffer();
+    const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let audioBuffer;
+    try {
+      audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer);
+    } catch (e) {
+      return null; // no audio track / undecodable
+    } finally {
+      tmpCtx.close();
+    }
+    if (!audioBuffer.numberOfChannels) return null;
+
+    const REQUIRED_HZ = 44100; // fixed by RNNoise's model, not configurable
+    const offlineCtx = new OfflineAudioContext(
+      1,
+      Math.ceil(audioBuffer.duration * REQUIRED_HZ),
+      REQUIRED_HZ
+    );
+    const bufferSrc = offlineCtx.createBufferSource();
+    bufferSrc.buffer = audioBuffer;
+    bufferSrc.connect(offlineCtx.destination);
+    bufferSrc.start();
+    const rendered = await offlineCtx.startRendering();
+    return rendered.getChannelData(0).slice(); // mono Float32Array @ 44100Hz
+  })();
+
+  decodedAudioCache.set(source.id, promise);
+  return promise;
+}
+
+function dbFS(samples, start, len) {
+  let sumSquares = 0;
+  const end = Math.min(start + len, samples.length);
+  const n = Math.max(1, end - start);
+  for (let i = start; i < end; i++) sumSquares += samples[i] * samples[i];
+  const rms = Math.sqrt(sumSquares / n);
+  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+}
+
+// Runs RNNoise across [rangeStart, rangeEnd) seconds of a decoded 44100Hz mono
+// buffer, denoises each frame, measures its dBFS, and returns the list of
+// speech regions (in seconds, absolute source time) that stay above the gate
+// after merging gaps shorter than SPEECH_MIN_GAP.
+//
+// Takes an already-created `processor` rather than making its own: the
+// underlying WASM build's RnnoiseProcessor.destroy() reliably crashes with a
+// "memory access out of bounds" RuntimeError once its processor has handled a
+// few hundred frames (reproduced directly against the library — processing
+// itself stays correct indefinitely, only its free/destroy path is unsafe
+// after sustained use). Since this runs once per scene, creating-and-destroying
+// per scene would hit that crash on any multi-scene edit. The fix: the caller
+// creates ONE processor for the whole speechOnlyEdit() run and never destroys
+// it — WASM memory for a single page-lifetime instance is not a real leak risk.
+async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
+  const REQUIRED_HZ = 44100;
+  const frameLen = RNNOISE_SAMPLE_LENGTH; // 480
+
+  const startSample = Math.floor(rangeStart * REQUIRED_HZ);
+  const endSample = Math.min(samples.length, Math.ceil(rangeEnd * REQUIRED_HZ));
+
+  const frameDurations = [];
+  let isSpeech = false;
+  let regionStart = null;
+  const regions = [];
+
+  for (let i = startSample; i < endSample; i += frameLen) {
+    const frame = new Float32Array(frameLen);
+    const chunkLen = Math.min(frameLen, endSample - i);
+    frame.set(samples.subarray(i, i + chunkLen));
+
+    processor.processAudioFrame(frame, true); // denoise in place
+    const db = dbFS(frame, 0, chunkLen);
+    const frameIsSpeech = db >= SPEECH_DB_THRESHOLD;
+    const frameStartT = i / REQUIRED_HZ;
+    const frameEndT = (i + chunkLen) / REQUIRED_HZ;
+
+    if (frameIsSpeech && !isSpeech) {
+      regionStart = frameStartT;
+      isSpeech = true;
+    } else if (!frameIsSpeech && isSpeech) {
+      regions.push([regionStart, frameEndT]);
+      isSpeech = false;
+    }
+  }
+  if (isSpeech && regionStart != null) regions.push([regionStart, endSample / REQUIRED_HZ]);
+
+  // Merge regions separated by a gap shorter than SPEECH_MIN_GAP so natural
+  // pauses between words/breaths don't get chopped into a choppy staccato edit.
+  const merged = [];
+  for (const [s, e] of regions) {
+    const last = merged[merged.length - 1];
+    if (last && s - last[1] < SPEECH_MIN_GAP) {
+      last[1] = e;
+    } else {
+      merged.push([s, e]);
+    }
+  }
+
+  // Pad each region with a little lead-in/lead-out: the dB gate fires right at
+  // the threshold crossing, which tends to clip the soft onset/tail of a word.
+  // Padding can make adjacent regions touch/overlap, so re-merge afterward.
+  const rangeStartS = startSample / REQUIRED_HZ;
+  const rangeEndS = endSample / REQUIRED_HZ;
+  const padded = merged.map(([s, e]) => [
+    Math.max(rangeStartS, s - SPEECH_PAD),
+    Math.min(rangeEndS, e + SPEECH_PAD),
+  ]);
+  const final = [];
+  for (const [s, e] of padded) {
+    const last = final[final.length - 1];
+    if (last && s <= last[1]) {
+      last[1] = Math.max(last[1], e);
+    } else {
+      final.push([s, e]);
+    }
+  }
+  return final;
+}
+
+async function speechOnlyEdit() {
+  const scenesToProcess = orderedScenes().filter(s => s.enabled);
+  if (!scenesToProcess.length || state.speechScanning) return;
+
+  state.speechScanning = true;
+  state.speechScanProgress = 0;
+  state.status = "Loading speech detector...";
+  render();
+
+  let processor;
+  try {
+    const wasmModule = await createRNNWasmModuleSync();
+    processor = new RnnoiseProcessor(wasmModule); // one shared instance for the whole run, see findSpeechRegions
+  } catch (e) {
+    state.speechScanning = false;
+    state.status = "Error: could not load speech detector — " + e.message;
+    render();
+    return;
+  }
+
+  const newScenesBySlot = [];
+
+  for (let idx = 0; idx < scenesToProcess.length; idx++) {
+    const scene = scenesToProcess[idx];
+    const src = sourceFor(scene);
+    state.status = `Screening ${src ? src.name : "clip"} for speech... (${idx + 1}/${scenesToProcess.length})`;
+    state.speechScanProgress = Math.round((idx / scenesToProcess.length) * 100);
+    render();
+
+    if (!src) continue;
+    const samples = await decodeSourceAudioMono44100(src);
+    if (!samples) {
+      // No audio track at all on this clip — nothing to gate on, drop it
+      // (an entirely silent source has no speech by definition).
+      continue;
+    }
+
+    const regions = await findSpeechRegions(samples, scene.trimIn, scene.trimOut, processor);
+
+    for (const [regionStart, regionEnd] of regions) {
+      const start = Math.max(scene.trimIn, regionStart);
+      const end = Math.min(scene.trimOut, regionEnd);
+      if (end - start < 0.1) continue; // sliver too small to be a usable clip
+      newScenesBySlot.push({
+        id: nextId(),
+        sourceId: scene.sourceId,
+        start: scene.start,
+        end: scene.end,
+        trimIn: start,
+        trimOut: end,
+        enabled: true,
+        thumb: scene.thumb,
+        fit: scene.fit,
+      });
+    }
+  }
+
+  // Replace only the scenes that were processed (enabled ones), preserving the
+  // position of any disabled scenes left untouched in the stack.
+  const processedIds = new Set(scenesToProcess.map(s => s.id));
+  const rebuiltOrder = [];
+  const rebuiltScenes = state.scenes.filter(s => !processedIds.has(s.id));
+  let insertedReplacement = false;
+  for (const id of state.order) {
+    if (!processedIds.has(id)) {
+      rebuiltOrder.push(id);
+      continue;
+    }
+    if (!insertedReplacement) {
+      for (const ns of newScenesBySlot) {
+        rebuiltScenes.push(ns);
+        rebuiltOrder.push(ns.id);
+      }
+      insertedReplacement = true;
+    }
+  }
+
+  state.scenes = rebuiltScenes;
+  state.order = rebuiltOrder;
+  state.activeSceneId = rebuiltOrder[0] || null;
+  state.speechScanning = false;
+  state.speechScanProgress = 100;
+  state.status = newScenesBySlot.length
+    ? `Speech Only: ${scenesToProcess.length} scene(s) re-cut into ${newScenesBySlot.length} speech segment(s)`
+    : "Speech Only: no speech detected in any enabled scene";
+  render();
+}
+
+/* ---------------- Export / render to downloadable video ---------------- */
+
+function drawSceneFrame(ctx, video, scene, canvasW, canvasH) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  const fit = scene.fit || "cover";
+  const canvasRatio = canvasW / canvasH;
+  const videoRatio = vw / vh;
+
+  if (fit === "fill") {
+    ctx.drawImage(video, 0, 0, vw, vh, 0, 0, canvasW, canvasH);
+    return;
+  }
+
+  // cover: scale so the frame fully fills the canvas, cropping overflow.
+  // contain: scale so the whole frame fits inside the canvas, letterboxed.
+  const scale = fit === "cover"
+    ? Math.max(canvasW / vw, canvasH / vh)
+    : Math.min(canvasW / vw, canvasH / vh);
+  const drawW = vw * scale, drawH = vh * scale;
+  const dx = (canvasW - drawW) / 2, dy = (canvasH - drawH) / 2;
+  ctx.drawImage(video, 0, 0, vw, vh, dx, dy, drawW, drawH);
+}
+
+async function exportVideo() {
+  const list = enabledOrderedScenes();
+  if (!list.length || state.exporting) return;
+
+  state.exporting = true;
+  state.exportProgress = 0;
+  render();
+
+  const ratio = CANVAS_RATIOS.find(r => r.id === state.canvasRatio) || CANVAS_RATIOS[0];
+  const canvasW = 1280;
+  const canvasH = Math.round(canvasW * (ratio.h / ratio.w));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasW;
+  canvas.height = canvasH;
+  const ctx = canvas.getContext("2d");
+
+  const exportVideoEl = document.createElement("video");
+  exportVideoEl.muted = false;
+  exportVideoEl.playsInline = true;
+  exportVideoEl.preload = "auto";
+
+  const FPS = 30;
+  const canvasStream = canvas.captureStream(FPS);
+
+  // Route each scene's audio into the recorded stream via a shared AudioContext
+  // destination, so the exported file keeps sound instead of coming out silent.
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioDest = audioCtx.createMediaStreamDestination();
+  let sourceNode = null;
+  let connectedEl = null;
+
+  const mixedStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+
+  const mimeType = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ].find(t => MediaRecorder.isTypeSupported(t)) || "video/webm";
+
+  const recorder = new MediaRecorder(mixedStream, { mimeType, videoBitsPerSecond: 6_000_000 });
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+
+  const finished = new Promise((resolve) => { recorder.onstop = resolve; });
+  recorder.start();
+
+  try {
+    let totalDur = 0;
+    for (const s of list) totalDur += (s.trimOut - s.trimIn);
+    let elapsed = 0;
+
+    for (const scene of list) {
+      const src = sourceFor(scene);
+      if (!src) continue;
+
+      if (exportVideoEl.src !== src.url) {
+        exportVideoEl.src = src.url;
+        await new Promise((resolve, reject) => {
+          exportVideoEl.onloadedmetadata = resolve;
+          exportVideoEl.onerror = () => reject(new Error("Could not load " + src.name));
+        });
+      }
+      if (!connectedEl) {
+        // createMediaElementSource may only be called once per <video> element ever,
+        // so this connects on first use and is then reused across every scene/source
+        // swap on this same element for the rest of the export.
+        sourceNode = audioCtx.createMediaElementSource(exportVideoEl);
+        sourceNode.connect(audioDest);
+        connectedEl = exportVideoEl;
+      }
+
+      exportVideoEl.currentTime = scene.trimIn;
+      await new Promise((resolve) => { exportVideoEl.onseeked = resolve; });
+      await exportVideoEl.play();
+
+      const sceneDur = scene.trimOut - scene.trimIn;
+      const sceneStart = performance.now();
+
+      await new Promise((resolve) => {
+        const step = () => {
+          if (exportVideoEl.currentTime >= scene.trimOut || exportVideoEl.ended) {
+            exportVideoEl.pause();
+            resolve();
+            return;
+          }
+          drawSceneFrame(ctx, exportVideoEl, scene, canvasW, canvasH);
+          const sceneElapsed = (performance.now() - sceneStart) / 1000;
+          state.exportProgress = Math.min(99, Math.round(((elapsed + sceneElapsed) / totalDur) * 100));
+          render();
+          requestAnimationFrame(step);
+        };
+        step();
+      });
+
+      elapsed += sceneDur;
+    }
+  } finally {
+    recorder.stop();
+    await finished;
+    audioCtx.close();
+  }
+
+  const blob = new Blob(chunks, { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "linear-edit.webm";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+  state.exporting = false;
+  state.exportProgress = 100;
+  state.status = "Export complete — download started";
+  render();
+}
+
+/* ---------------- Trim handle dragging ---------------- */
+
+function beginTrimDrag(handle, sceneId, trackEl) {
+  state.trimDragHandle = handle;
+  const scene = state.scenes.find(s => s.id === sceneId);
+  if (!scene) return;
+
+  const onMove = (e) => {
+    const rect = trackEl.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    let frac = (clientX - rect.left) / rect.width;
+    frac = Math.max(0, Math.min(1, frac));
+    const t = scene.start + frac * (scene.end - scene.start);
+    if (handle === "in") {
+      scene.trimIn = Math.min(t, scene.trimOut - 0.05);
+      scene.trimIn = Math.max(scene.start, scene.trimIn);
+    } else {
+      scene.trimOut = Math.max(t, scene.trimIn + 0.05);
+      scene.trimOut = Math.min(scene.end, scene.trimOut);
+    }
+    const mainVideo = document.getElementById("mainVideo");
+    if (mainVideo) mainVideo.currentTime = handle === "in" ? scene.trimIn : scene.trimOut;
+    render();
+  };
+  const onUp = () => {
+    state.trimDragHandle = null;
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    window.removeEventListener("touchmove", onMove);
+    window.removeEventListener("touchend", onUp);
+  };
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  window.addEventListener("touchmove", onMove);
+  window.addEventListener("touchend", onUp);
+}
+
+function resetTrim(sceneId) {
+  const s = state.scenes.find(s => s.id === sceneId);
+  if (s) { s.trimIn = s.start; s.trimOut = s.end; }
+  render();
+}
+
+function setSceneFit(sceneId, fit) {
+  const s = state.scenes.find(s => s.id === sceneId);
+  if (s) s.fit = fit;
+  render();
+}
+
+/* ---------------- Formatting ---------------- */
+
+function fmt(t) {
+  if (!isFinite(t)) return "0:00.0";
+  const m = Math.floor(t / 60);
+  const s = (t % 60).toFixed(1);
+  return `${m}:${s.padStart(4, "0")}`;
+}
+
+/* ---------------- Render ---------------- */
+
+function SceneCard(scene, index) {
+  const isActive = scene.id === state.activeSceneId;
+  const dur = scene.trimOut - scene.trimIn;
+  const src = sourceFor(scene);
+  return (
+    <div
+      class={`scene-card ${isActive ? "active" : ""} ${!scene.enabled ? "disabled" : ""} ${state.dragId === scene.id ? "dragging" : ""}`}
+      draggable="true"
+      onclick={() => selectScene(scene.id)}
+      ondragstart={(e) => { state.dragId = scene.id; e.dataTransfer.effectAllowed = "move"; render(); }}
+      ondragend={() => { state.dragId = null; render(); }}
+      ondragover={(e) => e.preventDefault()}
+      ondrop={(e) => { e.preventDefault(); if (state.dragId != null) moveScene(state.dragId, scene.id); }}
+    >
+      <div class="thumb" style={scene.thumb ? `background-image:url(${scene.thumb})` : ""}></div>
+      <div class="meta">
+        <div class="idx">Scene {index + 1}{state.sources.length > 1 && src ? ` · ${src.name}` : ""}</div>
+        <div class="dur">{fmt(dur)}</div>
+      </div>
+      <div class="actions">
+        <button title={scene.enabled ? "Disable" : "Enable"} class={!scene.enabled ? "off" : ""}
+          onclick={(e) => { e.stopPropagation(); toggleScene(scene.id); }}>
+          {scene.enabled ? "✓" : "✕"}
+        </button>
+        <button title="Remove" onclick={(e) => { e.stopPropagation(); removeScene(scene.id); }}>{"–"}</button>
+      </div>
+    </div>
+  );
+}
+
+function Timeline() {
+  const list = orderedScenes();
+  const total = list.reduce((a, s) => a + (s.enabled ? (s.trimOut - s.trimIn) : 0), 0) || 1;
+  let playedUpTo = 0;
+  if (state.isPlaying) {
+    const enabled = enabledOrderedScenes();
+    for (let i = 0; i < state.playingIndex; i++) {
+      playedUpTo += enabled[i].trimOut - enabled[i].trimIn;
+    }
+    const mainVideo = document.getElementById("mainVideo");
+    const cur = enabled[state.playingIndex];
+    if (mainVideo && cur) playedUpTo += Math.max(0, mainVideo.currentTime - cur.trimIn);
+  }
+  const playheadPct = Math.min(100, (playedUpTo / total) * 100);
+
+  return (
+    <div class="timeline-wrap">
+      <div class="timeline">
+        {list.filter(s => s.enabled).map(s => {
+          const w = ((s.trimOut - s.trimIn) / total) * 100;
+          return <div class="seg" style={`width:${w}%; background:${colorFor(s.id)}`}></div>;
+        })}
+        <div class="playhead" style={`left:${playheadPct}%`}></div>
+      </div>
+      <div class="timeline-labels">
+        <span>0:00</span>
+        <span>{fmt(total)} total</span>
+      </div>
+    </div>
+  );
+}
+
+const colorCache = {};
+function colorFor(id) {
+  if (!colorCache[id]) {
+    const hue = (id * 47) % 360;
+    colorCache[id] = `hsl(${hue}, 55%, 45%)`;
+  }
+  return colorCache[id];
+}
+
+function TrimPanel() {
+  const scene = state.scenes.find(s => s.id === state.activeSceneId);
+  if (!scene) {
+    return <div class="trim-panel"><div class="trim-header">Trim</div><div class="trim-empty">Select a scene to edit its in/out points.</div></div>;
+  }
+  const range = scene.end - scene.start;
+  const inPct = ((scene.trimIn - scene.start) / range) * 100;
+  const outPct = ((scene.trimOut - scene.start) / range) * 100;
+
+  return (
+    <div class="trim-panel">
+      <div class="trim-header">Trim Scene</div>
+      <div class="trim-body">
+        <div class="field">
+          <label>In point</label>
+          <div class="val">{fmt(scene.trimIn)}</div>
+        </div>
+        <div class="field">
+          <label>Out point</label>
+          <div class="val">{fmt(scene.trimOut)}</div>
+        </div>
+        <div class="field">
+          <label>Trimmed duration</label>
+          <div class="val">{fmt(scene.trimOut - scene.trimIn)}</div>
+        </div>
+        <div
+          class="trim-track"
+          id="trimTrack"
+        >
+          {scene.thumb && (
+            <div class="thumbs">
+              <img src={scene.thumb} />
+              <img src={scene.thumb} />
+              <img src={scene.thumb} />
+            </div>
+          )}
+          <div class="range" style={`left:${inPct}%; width:${outPct - inPct}%`}></div>
+          <div
+            class="handle" style={`left:calc(${inPct}% - 5px)`}
+            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id, document.getElementById("trimTrack")); }}
+            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id, document.getElementById("trimTrack")); }}
+          ></div>
+          <div
+            class="handle" style={`left:calc(${outPct}% - 5px)`}
+            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id, document.getElementById("trimTrack")); }}
+            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id, document.getElementById("trimTrack")); }}
+          ></div>
+        </div>
+        <div class="trim-actions">
+          <button onclick={() => resetTrim(scene.id)}>Reset trim</button>
+          <button class="primary" onclick={() => {
+            const mainVideo = document.getElementById("mainVideo");
+            if (mainVideo) { mainVideo.pause(); mainVideo.currentTime = scene.trimIn; mainVideo.play(); }
+          }}>Preview clip</button>
+        </div>
+        {sceneNeedsFit(scene) && (
+          <div class="field">
+            <label>Doesn't match {state.canvasRatio} output — fit mode</label>
+            <div class="fit-options">
+              {["cover", "contain", "fill"].map(mode => (
+                <button
+                  class={`fit-btn ${scene.fit === mode ? "active" : ""}`}
+                  onclick={() => setSceneFit(scene.id, mode)}
+                >{mode}</button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const list = orderedScenes();
+  const activeScene = state.scenes.find(s => s.id === state.activeSceneId);
+
+  return (
+    <div class="root" style="display:contents">
+      {state.busy && <div class="progress-bar" style={`width:${state.progress}%`}></div>}
+      <header>
+        <h1>Linear Scene Editor</h1>
+        <div class="sep"></div>
+        <div
+          class={`dropzone ${state.dragOverPage ? "drag" : ""}`}
+          ondragover={(e) => { e.preventDefault(); }}
+          ondrop={(e) => {
+            e.preventDefault();
+            const f = e.dataTransfer.files && e.dataTransfer.files[0];
+            if (f) loadFile(f);
+          }}
+        >
+          <button onclick={() => document.getElementById("fileInput").click()}>{state.sources.length ? "Add clip" : "Choose file"}</button>
+          <input id="fileInput" type="file" accept="video/*" onchange={(e) => {
+            const f = e.target.files[0];
+            if (f) loadFile(f);
+            e.target.value = "";
+          }} />
+          <input class="url-input" placeholder="...or paste a video URL and press Enter" type="text"
+            onkeydown={(e) => { if (e.key === "Enter") { loadURL(e.target.value.trim()); e.target.value = ""; } }} />
+          <span>drag more clips in to append them to the stack</span>
+        </div>
+        <div class="sep"></div>
+        <button class="speech-btn" title="Re-cut all clips to remove non-vocal silence (RNNoise, gated at -14dB)"
+          disabled={!list.filter(s => s.enabled).length || state.speechScanning || state.exporting}
+          onclick={speechOnlyEdit}>
+          {state.speechScanning ? `Screening... ${state.speechScanProgress}%` : "Speech Only"}
+        </button>
+        <div class="sep"></div>
+        <select class="ratio-select" title="Output canvas ratio" onchange={(e) => { state.canvasRatio = e.target.value; render(); }}>
+          {CANVAS_RATIOS.map(r => (
+            <option value={r.id} selected={r.id === state.canvasRatio}>{r.label}</option>
+          ))}
+        </select>
+        <button class="export-btn" disabled={!list.filter(s => s.enabled).length || state.exporting || state.speechScanning} onclick={exportVideo}>
+          {state.exporting ? `Rendering... ${state.exportProgress}%` : "Download video"}
+        </button>
+        <div class="sep"></div>
+        <div class={`status ${state.busy ? "busy" : ""}`}>{state.status}</div>
+      </header>
+
+      <div class="main">
+        <div class="stack-panel">
+          <div class="stack-header">
+            <span>Scene Stack ({list.filter(s=>s.enabled).length}/{list.length})</span>
+          </div>
+          <div class="stack-list">
+            {list.length === 0 && !state.busy && <div class="trim-empty">No scenes yet.</div>}
+            {list.map((s, i) => SceneCard(s, i))}
+          </div>
+          <div class="stack-footer">Drag cards to reorder playback sequence.</div>
+        </div>
+
+        <div class="preview-panel">
+          <div class="preview-stage">
+            <video id="mainVideo"
+              style={state.scenes.length ? "" : "display:none"}
+              ontimeupdate={onTimeUpdate}
+              onended={() => { if (!state.isPlaying) return; onTimeUpdate(); }}
+            ></video>
+            {!state.scenes.length && <div class="empty-hint">Load a video to begin scene detection.<br/>Scenes will appear in the stack on the left.</div>}
+          </div>
+          <div class="transport">
+            <button class={state.isPlaying ? "" : "play"} onclick={togglePlay} title={state.isPlaying ? "Stop" : "Play sequence"}>
+              {state.isPlaying ? "■" : "▶"}
+            </button>
+            {Timeline()}
+          </div>
+        </div>
+
+        {TrimPanel()}
+      </div>
+    </div>
+  );
+}
+
+const root = document.getElementById("app");
+
+function render() {
+  const tree = App();
+  applyDiff(root, tree);
+  syncActiveVideo();
+}
+
+// Keeps <video id="mainVideo"> pointed at the active scene's source. Only self-heals
+// when idle (not mid-drag, not mid-playback) since both of those paths already manage
+// the source/seek themselves and would fight a concurrent sync here.
+function syncActiveVideo() {
+  if (state.isPlaying || state.trimDragHandle) return;
+  const mainVideo = document.getElementById("mainVideo");
+  const scene = state.scenes.find(s => s.id === state.activeSceneId);
+  if (!mainVideo || !scene) return;
+  const src = sourceFor(scene);
+  if (!src || (mainVideo.dataset.loadedSourceId === String(src.id) && mainVideo.src)) return;
+  ensureVideoSource(mainVideo, scene).then(() => { mainVideo.currentTime = scene.trimIn; });
+}
+
+// page-level drag styling
+window.addEventListener("dragover", (e) => { e.preventDefault(); state.dragOverPage = true; });
+window.addEventListener("dragleave", () => { state.dragOverPage = false; });
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  state.dragOverPage = false;
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+render();
+</script>
+
+<script>
+(function () {
+  const src = document.getElementById("app-source").textContent;
+  const out = Babel.transform(src, {
+    presets: [],
+    plugins: [[Babel.availablePlugins["transform-react-jsx"], { runtime: "classic", pragma: "createElement", pragmaFrag: "Fragment" }]],
+    sourceType: "module",
+  }).code;
+  const blob = new Blob([out], { type: "text/javascript" });
+  const url = URL.createObjectURL(blob);
+  import(url);
+})();
+</script>
+</body>
+</html>
