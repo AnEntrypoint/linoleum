@@ -558,6 +558,33 @@ function playFromStart() {
   playCurrentSegment();
 }
 
+// Shared boundary-crossing watcher used by BOTH live preview playback and
+// export recording, so the two can never drift apart again the way they did
+// when preview used the coarse ~250ms `timeupdate` event (which could overshoot
+// trimOut by up to that long) while export used its own separate step loop that
+// dropped the final frame instead of drawing it. Polls on requestAnimationFrame
+// (paint-rate precision) and calls onFrame() before checking the boundary, so
+// the very last valid frame always gets a chance to be observed/drawn.
+function watchSceneBoundary(videoEl, scene, { onFrame, onBoundary }) {
+  let cancelled = false;
+  const step = () => {
+    if (cancelled) return;
+    // Draw/observe THIS frame first, even if currentTime has already reached or
+    // passed trimOut — otherwise the last valid frame before the cut is silently
+    // dropped instead of shown/recorded. Only stop advancing after that.
+    if (onFrame) onFrame();
+    if (videoEl.currentTime >= scene.trimOut || videoEl.ended) {
+      onBoundary();
+      return;
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+  return () => { cancelled = true; };
+}
+
+let cancelBoundaryWatch = null;
+
 async function playCurrentSegment() {
   const list = enabledOrderedScenes();
   const scene = list[state.playingIndex];
@@ -573,29 +600,25 @@ async function playCurrentSegment() {
     if (state.isPlaying) stopPlayback();
   });
   render();
-}
 
-function onTimeUpdate() {
-  if (!state.isPlaying) return;
-  const list = enabledOrderedScenes();
-  const scene = list[state.playingIndex];
-  const mainVideo = document.getElementById("mainVideo");
-  if (!scene || !mainVideo) return;
-  if (mainVideo.currentTime >= scene.trimOut) {
-    state.playingIndex++;
-    if (state.playingIndex >= list.length) {
-      stopPlayback();
-    } else {
-      playCurrentSegment();
-    }
-  } else {
-    render();
-  }
+  if (cancelBoundaryWatch) cancelBoundaryWatch();
+  cancelBoundaryWatch = watchSceneBoundary(mainVideo, scene, {
+    onFrame: () => render(),
+    onBoundary: () => {
+      state.playingIndex++;
+      if (state.playingIndex >= list.length) {
+        stopPlayback();
+      } else {
+        playCurrentSegment();
+      }
+    },
+  });
 }
 
 function stopPlayback() {
   state.isPlaying = false;
   state.playingIndex = -1;
+  if (cancelBoundaryWatch) { cancelBoundaryWatch(); cancelBoundaryWatch = null; }
   const mainVideo = document.getElementById("mainVideo");
   if (mainVideo) mainVideo.pause();
   render();
@@ -612,8 +635,11 @@ function togglePlay() {
 /* ---------------- Speech Only: re-cut scenes to remove non-vocal silence ---------------- */
 
 const SPEECH_DB_THRESHOLD = -14; // gate: below this on the denoised signal counts as non-speech
-const SPEECH_MIN_GAP = 0.3; // seconds — silence shorter than this is kept rather than cut
-const SPEECH_PAD = 0.15; // seconds of lead-in/lead-out padding added around each kept region
+const SPEECH_PAD = 0.7; // seconds of lead-in/lead-out padding added around each kept region
+// Silence shorter than this is kept rather than cut. Must comfortably exceed
+// 2*SPEECH_PAD — padding is capped at half the real gap to the next region, so a
+// too-small MIN_GAP would silently cap padding below SPEECH_PAD in the common case.
+const SPEECH_MIN_GAP = 2 * SPEECH_PAD + 0.2;
 
 // Decode a source URL's full audio track once (mono, resampled to RNNoise's
 // required 44100Hz) and cache it — multiple scenes on the same source clip
@@ -725,17 +751,19 @@ async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
 
   // Pad each region with a little lead-in/lead-out: the dB gate fires right at
   // the threshold crossing, which tends to clip the soft onset/tail of a word.
-  // Padding is capped at half the ACTUAL silence gap to the neighboring region
-  // (or the scene edge) — two regions that are already contiguous, or separated
-  // by only a sliver of silence, have nothing to pad into and must stay as-is
-  // rather than having padding manufacture a cut that was never there.
+  // Padding is capped at most of the ACTUAL silence gap to the neighboring region
+  // (or the scene edge), not just half — two regions that are already contiguous,
+  // or separated by only a sliver of silence, have nothing to pad into and must
+  // stay as-is rather than having padding manufacture a cut that was never there,
+  // but when a real gap exists each side can claim the bulk of it.
+  const GAP_CAP_FRACTION = 0.9;
   const rangeStartS = startSample / REQUIRED_HZ;
   const rangeEndS = endSample / REQUIRED_HZ;
   const final = merged.map(([s, e], i) => {
     const prevEnd = i > 0 ? merged[i - 1][1] : rangeStartS;
     const nextStart = i < merged.length - 1 ? merged[i + 1][0] : rangeEndS;
-    const leadPad = Math.min(SPEECH_PAD, (s - prevEnd) / 2);
-    const tailPad = Math.min(SPEECH_PAD, (nextStart - e) / 2);
+    const leadPad = Math.min(SPEECH_PAD, (s - prevEnd) * GAP_CAP_FRACTION);
+    const tailPad = Math.min(SPEECH_PAD, (nextStart - e) * GAP_CAP_FRACTION);
     return [s - Math.max(0, leadPad), e + Math.max(0, tailPad)];
   });
   return final;
@@ -938,20 +966,22 @@ async function exportVideo() {
       const sceneDur = scene.trimOut - scene.trimIn;
       const sceneStart = performance.now();
 
+      // Same watchSceneBoundary helper live preview playback uses, so export's
+      // cut points are identical to what was seen in preview — no separate
+      // boundary logic left to drift out of sync.
       await new Promise((resolve) => {
-        const step = () => {
-          if (exportVideoEl.currentTime >= scene.trimOut || exportVideoEl.ended) {
+        watchSceneBoundary(exportVideoEl, scene, {
+          onFrame: () => {
+            drawSceneFrame(ctx, exportVideoEl, scene, canvasW, canvasH);
+            const sceneElapsed = (performance.now() - sceneStart) / 1000;
+            state.exportProgress = Math.min(99, Math.round(((elapsed + sceneElapsed) / totalDur) * 100));
+            render();
+          },
+          onBoundary: () => {
             exportVideoEl.pause();
             resolve();
-            return;
-          }
-          drawSceneFrame(ctx, exportVideoEl, scene, canvasW, canvasH);
-          const sceneElapsed = (performance.now() - sceneStart) / 1000;
-          state.exportProgress = Math.min(99, Math.round(((elapsed + sceneElapsed) / totalDur) * 100));
-          render();
-          requestAnimationFrame(step);
-        };
-        step();
+          },
+        });
       });
 
       elapsed += sceneDur;
@@ -1246,8 +1276,6 @@ function App() {
           <div class="preview-stage">
             <video id="mainVideo"
               style={state.scenes.length ? "" : "display:none"}
-              ontimeupdate={onTimeUpdate}
-              onended={() => { if (!state.isPlaying) return; onTimeUpdate(); }}
             ></video>
             {!state.scenes.length && <div class="empty-hint">Load a video to begin scene detection.<br/>Scenes will appear in the stack on the left.</div>}
           </div>
