@@ -354,7 +354,7 @@ function thumbAt(t) {
 
 const SAMPLE_FPS = 4; // samples per second for diffing
 const THUMB_W = 160; // thumbnail-quality capture width, grabbed during the sweep
-const THUMB_SAMPLE_GAP = 0.5; // seconds between thumbnail captures during the sweep -- coarser than SAMPLE_FPS since only one thumb per scene is ever used, and MIN_LEN (1.2s) guarantees a nearby candidate for every scene
+const THUMB_SAMPLE_GAP = 0.25; // seconds between thumbnail captures during the sweep -- coarser than SAMPLE_FPS since only one thumb per scene is ever used; scenes shorter than this fall back to a targeted seek (thumbAt) for their thumbnail. Kept below MIN_LEN so short scenes still get a reused sample instead of a per-scene seek.
 
 // Sweeps offVideo through [0, duration) ONCE via a fast muted playback pass,
 // sampling frames with requestVideoFrameCallback instead of the old
@@ -403,17 +403,27 @@ async function sweepVideoFrames(duration, w, h, onSample) {
   // Only ONE thumbnail per detected scene is ever actually used (nearest to
   // that scene's midpoint), so capturing one on every diff-sample (up to
   // SAMPLE_FPS/sec) is mostly wasted work -- capture at a much coarser
-  // interval instead, well under MIN_LEN (1.2s, the shortest a scene can be)
-  // so every scene still has at least one nearby candidate.
+  // interval instead; scenes shorter than THUMB_SAMPLE_GAP fall back to a
+  // targeted seek (thumbAt) rather than always having a nearby candidate.
   let lastSampledAt = -Infinity;
   let lastThumbAt = -Infinity;
   let corsBlocked = false;
   let sawTaintedError = false;
 
   await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; offVideo.removeEventListener("ended", onEnded); resolve(); } };
+    // "ended" is the authoritative completion signal -- RVFC is not guaranteed
+    // to fire again once the video reaches its end (reproduced: the sweep hung
+    // at 100% forever waiting on one more callback that never came, once a cut
+    // near the tail meant the last onSample already reported frac~1 before the
+    // video actually finished playing out).
+    const onEnded = () => finish();
+    offVideo.addEventListener("ended", onEnded);
     const onFrame = (now, metadata) => {
+      if (settled) return;
       if (sawTaintedError || offVideo.ended || offVideo.currentTime >= duration - 0.02) {
-        resolve();
+        finish();
         return;
       }
       const t = metadata.mediaTime;
@@ -431,9 +441,11 @@ async function sweepVideoFrames(duration, w, h, onSample) {
           if (e instanceof TaintedCanvasError) {
             corsBlocked = true;
             sawTaintedError = true;
-            resolve();
+            finish();
             return;
           }
+          settled = true;
+          offVideo.removeEventListener("ended", onEnded);
           reject(e);
           return;
         }
@@ -548,7 +560,7 @@ async function detectScenes(url, sourceId, sourceLabel) {
 
   cutTimes.push(duration);
   // dedupe / enforce min scene length
-  const MIN_LEN = 1.2;
+  const MIN_LEN = 0.3;
   const cleaned = [cutTimes[0]];
   for (let i = 1; i < cutTimes.length; i++) {
     if (cutTimes[i] - cleaned[cleaned.length - 1] >= MIN_LEN) cleaned.push(cutTimes[i]);
@@ -592,8 +604,13 @@ async function detectScenes(url, sourceId, sourceLabel) {
     }
     scenes[i].thumb = best && bestDist <= THUMB_MATCH_TOLERANCE ? best.thumb : await thumbAt(mid);
     state.progress = Math.round(((i + 1) / scenes.length) * 100);
-    render();
+    // Direct DOM write instead of a full render() per scene -- same fix as
+    // the sweep loop above, for the same reason: this loop can now run over
+    // many more (much shorter) scenes, and a full re-render per iteration
+    // reproduced the same freeze-at-100% the sweep loop was fixed for.
+    updateSweepProgressDOM();
   }
+  render();
 
   state.scenes = state.scenes.concat(scenes);
   state.order = state.order.concat(scenes.map(s => s.id));
@@ -850,6 +867,70 @@ async function playCurrentSegment() {
       }
     },
   });
+}
+
+// Seeks playback to an absolute time within the enabled-scene sequence (as
+// shown by the timeline bar) -- maps sequence time to (scene, in-scene time),
+// then either jumps a live play-through to that scene/offset or just parks
+// the preview there when stopped. The timeline previously rendered a playhead
+// but had no click/drag handler at all, so scrubbing did nothing.
+function seekToSequenceTime(seqTime) {
+  const list = enabledOrderedScenes();
+  if (!list.length) return;
+  const totalDur = list.reduce((a, s) => a + (s.trimOut - s.trimIn), 0);
+  let t = Math.max(0, Math.min(totalDur - 0.001, seqTime));
+  let index = 0;
+  for (; index < list.length; index++) {
+    const segDur = list[index].trimOut - list[index].trimIn;
+    if (t <= segDur || index === list.length - 1) break;
+    t -= segDur;
+  }
+  const scene = list[index];
+  const target = scene.trimIn + t;
+  state.activeSceneId = scene.id;
+  const mainVideo = document.getElementById("mainVideo");
+  if (state.isPlaying) {
+    state.playingIndex = index;
+    ensureVideoSource(mainVideo, scene).then(() => {
+      if (!state.isPlaying) return;
+      mainVideo.currentTime = target;
+    });
+    if (cancelBoundaryWatch) cancelBoundaryWatch();
+    cancelBoundaryWatch = watchSceneBoundary(mainVideo, scene, {
+      onFrame: () => render(),
+      onBoundary: () => {
+        state.playingIndex++;
+        if (state.playingIndex >= list.length) stopPlayback();
+        else playCurrentSegment();
+      },
+    });
+  } else if (mainVideo) {
+    mainVideo.pause();
+    ensureVideoSource(mainVideo, scene).then(() => { mainVideo.currentTime = target; });
+  }
+  render();
+}
+
+let timelineDragging = false;
+function beginTimelineScrub(e) {
+  const track = e.currentTarget;
+  timelineDragging = true;
+  const onMove = (ev) => {
+    if (!timelineDragging) return;
+    const rect = track.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    const list = enabledOrderedScenes();
+    const totalDur = list.reduce((a, s) => a + (s.trimOut - s.trimIn), 0);
+    seekToSequenceTime(pct * totalDur);
+  };
+  const onUp = () => {
+    timelineDragging = false;
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  };
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  onMove(e);
 }
 
 function stopPlayback() {
@@ -1520,7 +1601,7 @@ function Timeline() {
 
   return (
     <div class="timeline-wrap">
-      <div class="timeline">
+      <div class="timeline" onmousedown={beginTimelineScrub}>
         {list.filter(s => s.enabled).map(s => {
           const w = ((s.trimOut - s.trimIn) / total) * 100;
           return <div class="seg" style={`width:${w}%; background:${colorFor(s.id)}`}></div>;
