@@ -743,6 +743,9 @@ const SPEECH_PAD = 0.7; // seconds of lead-in/lead-out padding added around each
 // 2*SPEECH_PAD — padding is capped at half the real gap to the next region, so a
 // too-small MIN_GAP would silently cap padding below SPEECH_PAD in the common case.
 const SPEECH_MIN_GAP = 2 * SPEECH_PAD + 0.2;
+// Reject any input scene or detected speech region shorter than this outright
+// -- too short to be a meaningfully usable clip or to run detection on.
+const MIN_CLIP_LENGTH = 1.0;
 
 // Decode a source URL's full audio track once (mono, resampled to RNNoise's
 // required 44100Hz) and cache it — multiple scenes on the same source clip
@@ -946,6 +949,7 @@ async function speechOnlyEdit(sceneIds = null) {
   }
 
   const newScenesBySlot = [];
+  const rejectedTooShortIds = new Set();
 
   for (let idx = 0; idx < scenesToProcess.length; idx++) {
     const scene = scenesToProcess[idx];
@@ -955,6 +959,13 @@ async function speechOnlyEdit(sceneIds = null) {
     render();
 
     if (!src) continue;
+    if (scene.trimOut - scene.trimIn < MIN_CLIP_LENGTH) {
+      // Too short to meaningfully run speech detection on -- reject from this
+      // Speech Only pass and leave the scene exactly as-is in the stack,
+      // rather than feeding a sliver into RNNoise/VAD or silently deleting it.
+      rejectedTooShortIds.add(scene.id);
+      continue;
+    }
     const samples = await decodeSourceAudioMono44100(src);
     if (!samples) {
       // No audio track at all on this clip — nothing to gate on, drop it
@@ -967,7 +978,7 @@ async function speechOnlyEdit(sceneIds = null) {
     for (const [regionStart, regionEnd] of regions) {
       const start = Math.max(scene.trimIn, regionStart);
       const end = Math.min(scene.trimOut, regionEnd);
-      if (end - start < 0.1) continue; // sliver too small to be a usable clip
+      if (end - start < MIN_CLIP_LENGTH) continue; // detected region too short to be a usable clip
       newScenesBySlot.push({
         id: nextId(),
         sourceId: scene.sourceId,
@@ -982,9 +993,10 @@ async function speechOnlyEdit(sceneIds = null) {
     }
   }
 
-  // Replace only the scenes that were processed (enabled ones), preserving the
-  // position of any disabled scenes left untouched in the stack.
-  const processedIds = new Set(scenesToProcess.map(s => s.id));
+  // Replace only the scenes that were actually processed, preserving the
+  // position of any disabled scenes AND any too-short rejected scenes
+  // (rejectedTooShortIds) left untouched in the stack.
+  const processedIds = new Set(scenesToProcess.filter(s => !rejectedTooShortIds.has(s.id)).map(s => s.id));
   const rebuiltOrder = [];
   const rebuiltScenes = state.scenes.filter(s => !processedIds.has(s.id));
   let insertedReplacement = false;
@@ -1007,9 +1019,12 @@ async function speechOnlyEdit(sceneIds = null) {
   state.activeSceneId = rebuiltOrder[0] || null;
   state.speechScanning = false;
   state.speechScanProgress = 100;
-  state.status = newScenesBySlot.length
+  const rejectedSuffix = rejectedTooShortIds.size
+    ? ` (${rejectedTooShortIds.size} scene(s) skipped: shorter than ${MIN_CLIP_LENGTH}s)`
+    : "";
+  state.status = (newScenesBySlot.length
     ? `Speech Only: ${scenesToProcess.length} scene(s) re-cut into ${newScenesBySlot.length} speech segment(s)`
-    : "Speech Only: no speech detected in any enabled scene";
+    : "Speech Only: no speech detected in any enabled scene") + rejectedSuffix;
   render();
 }
 
@@ -1189,14 +1204,22 @@ function drawScrubPreview() {
   ctx.drawImage(mainVideo, 0, 0, vw, vh, dx, dy, drawW, drawH);
 }
 
-function beginTrimDrag(handle, sceneId, trackEl) {
+// beginTrimDrag intentionally re-fetches mainVideo/trimTrack via
+// document.getElementById() fresh inside every callback below, rather than
+// capturing them once at drag-start, matching the safe pattern documented at
+// syncActiveVideo: webjsx's diffing can replace DOM nodes across renders
+// (e.g. if the tree structure changes elsewhere while a drag is in progress),
+// which would silently detach a captured reference -- seeks writing to a
+// detached video, the 'seeked' listener never firing again, or onMove's
+// getBoundingClientRect() computed against a stale/removed track element.
+function beginTrimDrag(handle, sceneId) {
   state.trimDragHandle = handle;
   const scene = state.scenes.find(s => s.id === sceneId);
   if (!scene) return;
 
-  const mainVideo = document.getElementById("mainVideo");
   let pendingFrac = null;
   let rafScheduled = false;
+  let seekedListenerVideo = null; // the element onSeeked is currently attached to
 
   // rAF-batches the seek so a burst of mousemove events (which can fire far
   // faster than the video can decode/seek) collapses to at most one seek per
@@ -1214,11 +1237,29 @@ function beginTrimDrag(handle, sceneId, trackEl) {
       scene.trimOut = Math.max(t, scene.trimIn + 0.05);
       scene.trimOut = Math.min(scene.end, scene.trimOut);
     }
-    if (mainVideo) mainVideo.currentTime = handle === "in" ? scene.trimIn : scene.trimOut;
+    const mainVideo = document.getElementById("mainVideo");
+    if (mainVideo) {
+      mainVideo.currentTime = handle === "in" ? scene.trimIn : scene.trimOut;
+      ensureSeekedListener(mainVideo);
+    }
     render();
   };
 
+  const onSeeked = () => drawScrubPreview();
+
+  // Keeps the 'seeked' listener attached to whichever <video> element is
+  // currently live, re-attaching if webjsx swapped it out from under the drag.
+  function ensureSeekedListener(mainVideo) {
+    if (seekedListenerVideo === mainVideo) return;
+    if (seekedListenerVideo) seekedListenerVideo.removeEventListener("seeked", onSeeked);
+    mainVideo.addEventListener("seeked", onSeeked);
+    seekedListenerVideo = mainVideo;
+  }
+
   const onMove = (e) => {
+    if (e.touches) e.preventDefault(); // stop the page from scrolling under a touch drag
+    const trackEl = document.getElementById("trimTrack");
+    if (!trackEl) return;
     const rect = trackEl.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     let frac = (clientX - rect.left) / rect.width;
@@ -1228,12 +1269,13 @@ function beginTrimDrag(handle, sceneId, trackEl) {
       requestAnimationFrame(flush);
     }
   };
-  const onSeeked = () => drawScrubPreview();
-  if (mainVideo) mainVideo.addEventListener("seeked", onSeeked);
+
+  const initialVideo = document.getElementById("mainVideo");
+  if (initialVideo) ensureSeekedListener(initialVideo);
 
   const onUp = () => {
     state.trimDragHandle = null;
-    if (mainVideo) mainVideo.removeEventListener("seeked", onSeeked);
+    if (seekedListenerVideo) seekedListenerVideo.removeEventListener("seeked", onSeeked);
     window.removeEventListener("mousemove", onMove);
     window.removeEventListener("mouseup", onUp);
     window.removeEventListener("touchmove", onMove);
@@ -1243,6 +1285,7 @@ function beginTrimDrag(handle, sceneId, trackEl) {
     // original detection-time frame. Reads directly off mainVideo (already seeked
     // to trimIn/trimOut by flush() above) rather than the shared offVideo/offCanvas
     // singleton, which detectScenes/loadAsyncIs may be using for a different source.
+    const mainVideo = document.getElementById("mainVideo");
     if (mainVideo && mainVideo.videoWidth) {
       const w = 160, h = Math.round(160 * (mainVideo.videoHeight / mainVideo.videoWidth));
       offCanvas.width = w; offCanvas.height = h;
@@ -1256,7 +1299,10 @@ function beginTrimDrag(handle, sceneId, trackEl) {
   };
   window.addEventListener("mousemove", onMove);
   window.addEventListener("mouseup", onUp);
-  window.addEventListener("touchmove", onMove);
+  // touchmove must be non-passive for onMove's preventDefault() to actually
+  // block the browser's default touch-scroll gesture (addEventListener
+  // defaults touch listeners to passive:true, which silently no-ops preventDefault).
+  window.addEventListener("touchmove", onMove, { passive: false });
   window.addEventListener("touchend", onUp);
 }
 
@@ -1405,13 +1451,13 @@ function TrimPanel() {
           {isScrubbing && <div class="playhead2" style={`left:${scrubPct}%`}></div>}
           <div
             class="handle" style={`left:calc(${inPct}% - 5px)`}
-            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id, document.getElementById("trimTrack")); }}
-            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id, document.getElementById("trimTrack")); }}
+            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id); }}
+            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id); }}
           ></div>
           <div
             class="handle" style={`left:calc(${outPct}% - 5px)`}
-            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id, document.getElementById("trimTrack")); }}
-            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id, document.getElementById("trimTrack")); }}
+            onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id); }}
+            ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id); }}
           ></div>
         </div>
         {isScrubbing && (
