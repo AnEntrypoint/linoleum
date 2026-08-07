@@ -493,7 +493,6 @@ async function detectScenes(url, sourceId, sourceLabel) {
   let prevData = null;
   const samples = []; // {t, diff}
   const thumbSamples = []; // {t, thumb} -- reused for capture-thumbnails-during-detection-sweep
-  let lastRenderAt = 0;
 
   const { corsBlocked } = await sweepVideoFrames(duration, w, h, (t, data, thumb, frac) => {
     if (prevData) samples.push({ t, diff: frameDiff(prevData, data) });
@@ -501,12 +500,18 @@ async function detectScenes(url, sourceId, sourceLabel) {
     if (thumb) thumbSamples.push({ t, thumb });
     state.progress = Math.round(frac * 100);
     state.status = `Analyzing ${sourceLabel}... ${state.progress}%`;
-    // Throttle renders to roughly every 150ms of wall-clock rather than every
-    // sample -- RVFC can fire far more often than the old 3-samples-per-render
-    // cadence assumed, and re-rendering the whole tree on every frame would
-    // itself become a bottleneck during the now much-faster sweep.
-    const now = performance.now();
-    if (now - lastRenderAt > 150) { lastRenderAt = now; render(); }
+    // Update the progress bar/status text directly instead of calling the
+    // full render() from inside the tight RVFC sample loop. A Chrome trace
+    // taken while this OOM'd showed jsEventListeners climbing steadily
+    // (linear growth, ~40-60/tick) on a FIXED set of DOM nodes (node count
+    // never changed) while re-rendering the whole App() tree here every
+    // ~150ms during the sweep -- pointing at rapid/re-entrant render() calls
+    // as the trigger regardless of the exact internal cause. These two nodes
+    // are already mounted (detectScenes sets state.busy=true and calls
+    // render() once before the sweep starts), so a direct, listener-free DOM
+    // write is both cheaper and structurally can't leak listeners the way a
+    // full re-render apparently did.
+    updateSweepProgressDOM();
   });
 
   let cutTimes = [0];
@@ -1738,6 +1743,18 @@ function render() {
   const tree = App();
   applyDiff(root, tree);
   syncActiveVideo();
+}
+
+// Direct DOM write for the progress bar/status text during a detection
+// sweep, bypassing the full VDOM render() -- see the call site in
+// detectScenes for why. Both nodes are assumed already mounted (state.busy
+// must be true and render() called at least once before the sweep starts);
+// silently no-ops if either is missing rather than throwing mid-sweep.
+function updateSweepProgressDOM() {
+  const bar = document.querySelector(".progress-bar");
+  if (bar) bar.style.width = state.progress + "%";
+  const statusEl = document.querySelector(".status");
+  if (statusEl) statusEl.textContent = state.status;
 }
 
 // Keeps <video id="mainVideo"> pointed at the active scene's source. Only self-heals
