@@ -656,9 +656,16 @@ function addSource(url, name) {
   return source;
 }
 
-// Stages a file/URL for import: creates the source and audio-normalization
-// kickoff immediately, but defers scene creation until the user picks an
-// import mode (as-is / split / split + speech-only) via the pending-import modal.
+// Stages a file/URL for import: creates the source, but defers BOTH scene
+// creation and audio decode until the user picks an import mode via the
+// pending-import modal. decodeSourceAudioMono44100 is only ever triggered
+// on-demand from inside speechOnlyEdit when Speech Only actually runs
+// (never speculatively here) -- for a large file, eagerly decoding the
+// entire audio track (full-file ArrayBuffer + native-samplerate AudioBuffer
+// + a re-rendered 44100Hz buffer + a copy of that) concurrently with
+// detectScenes's own video-frame sweep was a real OOM cause, confirmed
+// against a large real source file: several full-length buffers held in
+// memory at once on top of the sweep's own per-frame work.
 function loadFile(file) {
   if (state.pendingImport) return; // one import choice at a time; resolve the modal first
   if (!file || !file.type.startsWith("video/")) {
@@ -668,7 +675,6 @@ function loadFile(file) {
   }
   const url = URL.createObjectURL(file);
   const source = addSource(url, file.name);
-  decodeSourceAudioMono44100(source).catch(() => {}); // kick off normalization; failures are fine, gating/export fall back to unity gain
   state.pendingImport = { sourceId: source.id, url, name: file.name };
   render();
 }
@@ -678,7 +684,6 @@ function loadURL(url) {
   if (!url) return;
   const name = url.split("/").pop().split("?")[0] || url;
   const source = addSource(url, name);
-  decodeSourceAudioMono44100(source).catch(() => {}); // kick off normalization; failures are fine, gating/export fall back to unity gain
   state.pendingImport = { sourceId: source.id, url, name };
   render();
 }
