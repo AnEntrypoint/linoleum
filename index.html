@@ -727,7 +727,17 @@ function togglePlay() {
 
 /* ---------------- Speech Only: re-cut scenes to remove non-vocal silence ---------------- */
 
-const SPEECH_DB_THRESHOLD = -14; // gate: below this on the denoised signal counts as non-speech
+// Gate: RNNoise VAD score below this counts as non-speech. Empirically tuned
+// against 5 real recordings spanning 6s-573s and mean levels -26.4dB to -12.5dB
+// (Node.js offline harness replaying the exact compress->normalize->RNNoise
+// pipeline): kept-speech fraction is nearly flat between 0.4-0.5 on every
+// clip, then drops meaningfully by 0.8-0.9 on at least one clip (86.6% vs
+// 99.9% kept on a 42s clip) -- i.e. higher thresholds start cutting real
+// dialog before lower ones show any corresponding benefit. Erring low
+// favors keeping a little extra ambient audio around speech over ever
+// cutting real dialog.
+const VAD_THRESHOLD = 0.5;
+const VAD_SMOOTH_FRAMES = 3; // rolling-average window (frames) to reduce per-frame VAD flicker
 const SPEECH_PAD = 0.7; // seconds of lead-in/lead-out padding added around each kept region
 // Silence shorter than this is kept rather than cut. Must comfortably exceed
 // 2*SPEECH_PAD — padding is capped at half the real gap to the next region, so a
@@ -739,14 +749,10 @@ const SPEECH_MIN_GAP = 2 * SPEECH_PAD + 0.2;
 // reuse this instead of re-decoding/re-running RNNoise per scene.
 const decodedAudioCache = new Map(); // sourceId -> Promise<Float32Array | null>
 
-// Peak gain applied to each source's decoded analysis buffer, keyed by
-// source.id — export reuses this so the mixed-out audio matches what the
-// -14dB gate actually measured instead of the raw, un-normalized track.
-const sourceNormalizationGain = new Map(); // sourceId -> number
-
 // Peak-normalizes samples in place to target dBFS (0 = full scale) and
 // returns the applied linear gain. A silent/near-silent buffer is left
-// untouched (gain 1) rather than amplified toward infinity.
+// untouched (gain 1) rather than amplified toward infinity. Analysis-only:
+// never applied to the exported/rendered audio.
 function peakNormalize(samples, targetDb = 0) {
   let peak = 0;
   for (let i = 0; i < samples.length; i++) {
@@ -761,6 +767,14 @@ function peakNormalize(samples, targetDb = 0) {
   return gain;
 }
 
+// Decodes a source's audio for SPEECH DETECTION ONLY, at 44100Hz mono, run
+// through a slow-attack/slow-release compressor so quiet-but-real dialog
+// within a dynamically-varying recording gets brought up toward the same
+// effective level as louder sections instead of sitting under the gate.
+// The compressor + normalization below exist purely to make speech easier
+// to detect; the exported/downloaded audio always uses the untouched
+// original source (see exportVideo's gainNode.gain.value = 1) and never
+// sees this processing.
 async function decodeSourceAudioMono44100(source) {
   if (decodedAudioCache.has(source.id)) return decodedAudioCache.get(source.id);
 
@@ -786,17 +800,28 @@ async function decodeSourceAudioMono44100(source) {
     );
     const bufferSrc = offlineCtx.createBufferSource();
     bufferSrc.buffer = audioBuffer;
-    bufferSrc.connect(offlineCtx.destination);
+
+    // Slow release keeps the compressor from pumping on every syllable (which
+    // would distort the signal RNNoise/VAD sees); the goal here is to level
+    // out whole quiet-vs-loud SECTIONS of a clip, not aggressively squash
+    // moment-to-moment dynamics. Ratio 4:1 with a low threshold brings quiet
+    // dialog up without fully flattening louder speech into the noise floor.
+    const compressor = offlineCtx.createDynamicsCompressor();
+    compressor.threshold.value = -40;
+    compressor.knee.value = 30;
+    compressor.ratio.value = 4;
+    compressor.attack.value = 0.05;
+    compressor.release.value = 1.0;
+
+    bufferSrc.connect(compressor);
+    compressor.connect(offlineCtx.destination);
     bufferSrc.start();
     const rendered = await offlineCtx.startRendering();
-    const mono = rendered.getChannelData(0).slice(); // mono Float32Array @ 44100Hz
+    const mono = rendered.getChannelData(0).slice(); // mono Float32Array @ 44100Hz, compressed
 
-    // Normalize so the -14dB speech gate (SPEECH_DB_THRESHOLD) measures a
-    // consistent reference level regardless of how hot/quiet the source was
-    // recorded — otherwise a quiet source never crosses the gate and a hot
-    // one always does.
-    const gain = peakNormalize(mono, 0);
-    sourceNormalizationGain.set(source.id, gain);
+    // Peak-normalize the compressed buffer so the VAD/level gate measures a
+    // consistent reference regardless of how hot/quiet the source was overall.
+    peakNormalize(mono, 0);
     return mono;
   })();
 
@@ -804,19 +829,23 @@ async function decodeSourceAudioMono44100(source) {
   return promise;
 }
 
-function dbFS(samples, start, len) {
-  let sumSquares = 0;
-  const end = Math.min(start + len, samples.length);
-  const n = Math.max(1, end - start);
-  for (let i = start; i < end; i++) sumSquares += samples[i] * samples[i];
-  const rms = Math.sqrt(sumSquares / n);
-  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
-}
-
 // Runs RNNoise across [rangeStart, rangeEnd) seconds of a decoded 44100Hz mono
-// buffer, denoises each frame, measures its dBFS, and returns the list of
-// speech regions (in seconds, absolute source time) that stay above the gate
-// after merging gaps shorter than SPEECH_MIN_GAP.
+// buffer and returns the list of speech regions (in seconds, absolute source
+// time) that stay above the VAD gate after merging gaps shorter than
+// SPEECH_MIN_GAP.
+//
+// Gates on RNNoise's own voice-activity-detection score (processAudioFrame's
+// return value, a 0-1 speech probability the model was directly trained to
+// output) rather than a fixed dBFS threshold on the denoised signal. A level
+// threshold is fundamentally level-dependent -- a peak-normalized-but-quiet
+// recording can still have real dialog sitting under a fixed dB gate even
+// after normalization, since normalization only calibrates the single
+// loudest sample, not the RMS level of quieter speech elsewhere in the clip.
+// VAD score has no such dependency: it reflects how speech-like the frame's
+// spectral shape is, independent of its absolute level. VAD_SMOOTH_FRAMES
+// averages a short rolling window of scores (RNNoise's per-frame VAD can
+// flicker frame-to-frame even within continuous speech) to avoid choppy
+// region boundaries from single noisy frames.
 //
 // Takes an already-created `processor` rather than making its own: the
 // underlying WASM build's RnnoiseProcessor.destroy() reliably crashes with a
@@ -834,19 +863,21 @@ async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
   const startSample = Math.floor(rangeStart * REQUIRED_HZ);
   const endSample = Math.min(samples.length, Math.ceil(rangeEnd * REQUIRED_HZ));
 
-  const frameDurations = [];
   let isSpeech = false;
   let regionStart = null;
   const regions = [];
+  const recentVad = [];
 
   for (let i = startSample; i < endSample; i += frameLen) {
     const frame = new Float32Array(frameLen);
     const chunkLen = Math.min(frameLen, endSample - i);
     frame.set(samples.subarray(i, i + chunkLen));
 
-    processor.processAudioFrame(frame, true); // denoise in place
-    const db = dbFS(frame, 0, chunkLen);
-    const frameIsSpeech = db >= SPEECH_DB_THRESHOLD;
+    const vad = processor.processAudioFrame(frame, true); // denoise in place, returns 0-1 VAD score
+    recentVad.push(vad);
+    if (recentVad.length > VAD_SMOOTH_FRAMES) recentVad.shift();
+    const smoothedVad = recentVad.reduce((a, b) => a + b, 0) / recentVad.length;
+    const frameIsSpeech = smoothedVad >= VAD_THRESHOLD;
     const frameStartT = i / REQUIRED_HZ;
     const frameEndT = (i + chunkLen) / REQUIRED_HZ;
 
@@ -872,7 +903,7 @@ async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
     }
   }
 
-  // Pad each region with a little lead-in/lead-out: the dB gate fires right at
+  // Pad each region with a little lead-in/lead-out: the VAD gate fires right at
   // the threshold crossing, which tends to clip the soft onset/tail of a word.
   // Padding is capped at most of the ACTUAL silence gap to the neighboring region
   // (or the scene edge), not just half — two regions that are already contiguous,
@@ -1085,11 +1116,10 @@ async function exportVideo() {
         sourceNode.connect(gainNode);
         connectedEl = exportVideoEl;
       }
-      // Apply the same peak-normalization gain the -14dB speech gate measured
-      // against at load (decodeSourceAudioMono44100) so the exported mix isn't
-      // left at the source's raw, un-normalized level. Falls back to unity gain
-      // for a source that was never analyzed (e.g. Speech Only was never run).
-      gainNode.gain.value = sourceNormalizationGain.get(src.id) ?? 1;
+      // Export always uses the source's untouched original level. Normalization/
+      // compression/VAD gating exist only to decide which time ranges count as
+      // speech for cutting -- they must never alter the rendered audio itself.
+      gainNode.gain.value = 1;
 
       exportVideoEl.currentTime = scene.trimIn;
       await new Promise((resolve) => { exportVideoEl.onseeked = resolve; });
