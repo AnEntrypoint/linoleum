@@ -1,3 +1,5 @@
 .gm/
 .agentplug/
 .agentplug-kv/
+.gm-test-assets/
+*.stackdump
