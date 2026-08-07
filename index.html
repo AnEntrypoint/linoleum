@@ -129,7 +129,13 @@
     display:flex; align-items:center; justify-content:center; border-radius:3px;
   }
   .trim-track .handle::after{content:''; width:2px; height:16px; background:#fff; opacity:.8; border-radius:1px;}
-  .trim-track .playhead2{position:absolute; top:-2px; bottom:-2px; width:2px; background:#fff;}
+  .trim-track .playhead2{
+    position:absolute; top:-2px; bottom:-2px; width:2px; background:#fff;
+    box-shadow:0 0 4px rgba(255,255,255,.9); pointer-events:none; z-index:2;
+  }
+  .field .val.scrub-time{color:var(--accent2);}
+  .scrub-preview{background:#000; border-radius:6px; overflow:hidden; border:1px solid var(--border);}
+  .scrub-preview canvas{width:100%; height:auto; display:block;}
   .trim-actions{display:flex; gap:8px;}
   .trim-actions button{
     flex:1; background:var(--panel2); border:1px solid var(--border); color:var(--text);
@@ -1136,16 +1142,40 @@ async function exportVideo() {
 
 /* ---------------- Trim handle dragging ---------------- */
 
+// Draws mainVideo's current frame into the scrub-preview canvas, if present.
+// Called on the video's 'seeked' event so it always reflects a real decoded
+// frame rather than racing ahead of the decoder on every mousemove tick.
+function drawScrubPreview() {
+  const canvas = document.getElementById("scrubCanvas");
+  const mainVideo = document.getElementById("mainVideo");
+  if (!canvas || !mainVideo || !mainVideo.videoWidth) return;
+  const ctx = canvas.getContext("2d");
+  const vw = mainVideo.videoWidth, vh = mainVideo.videoHeight;
+  const scale = Math.min(canvas.width / vw, canvas.height / vh);
+  const drawW = vw * scale, drawH = vh * scale;
+  const dx = (canvas.width - drawW) / 2, dy = (canvas.height - drawH) / 2;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(mainVideo, 0, 0, vw, vh, dx, dy, drawW, drawH);
+}
+
 function beginTrimDrag(handle, sceneId, trackEl) {
   state.trimDragHandle = handle;
   const scene = state.scenes.find(s => s.id === sceneId);
   if (!scene) return;
 
-  const onMove = (e) => {
-    const rect = trackEl.getBoundingClientRect();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    let frac = (clientX - rect.left) / rect.width;
-    frac = Math.max(0, Math.min(1, frac));
+  const mainVideo = document.getElementById("mainVideo");
+  let pendingFrac = null;
+  let rafScheduled = false;
+
+  // rAF-batches the seek so a burst of mousemove events (which can fire far
+  // faster than the video can decode/seek) collapses to at most one seek per
+  // frame instead of queuing up a backlog the video visibly lags behind.
+  const flush = () => {
+    rafScheduled = false;
+    if (pendingFrac == null) return;
+    const frac = pendingFrac;
+    pendingFrac = null;
     const t = scene.start + frac * (scene.end - scene.start);
     if (handle === "in") {
       scene.trimIn = Math.min(t, scene.trimOut - 0.05);
@@ -1154,16 +1184,45 @@ function beginTrimDrag(handle, sceneId, trackEl) {
       scene.trimOut = Math.max(t, scene.trimIn + 0.05);
       scene.trimOut = Math.min(scene.end, scene.trimOut);
     }
-    const mainVideo = document.getElementById("mainVideo");
     if (mainVideo) mainVideo.currentTime = handle === "in" ? scene.trimIn : scene.trimOut;
     render();
   };
+
+  const onMove = (e) => {
+    const rect = trackEl.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    let frac = (clientX - rect.left) / rect.width;
+    pendingFrac = Math.max(0, Math.min(1, frac));
+    if (!rafScheduled) {
+      rafScheduled = true;
+      requestAnimationFrame(flush);
+    }
+  };
+  const onSeeked = () => drawScrubPreview();
+  if (mainVideo) mainVideo.addEventListener("seeked", onSeeked);
+
   const onUp = () => {
     state.trimDragHandle = null;
+    if (mainVideo) mainVideo.removeEventListener("seeked", onSeeked);
     window.removeEventListener("mousemove", onMove);
     window.removeEventListener("mouseup", onUp);
     window.removeEventListener("touchmove", onMove);
     window.removeEventListener("touchend", onUp);
+    // Refresh the handle-adjacent thumbnail to the actual trimmed frame so the
+    // trim-track's visual strip reflects the current selection, not the scene's
+    // original detection-time frame. Reads directly off mainVideo (already seeked
+    // to trimIn/trimOut by flush() above) rather than the shared offVideo/offCanvas
+    // singleton, which detectScenes/loadAsyncIs may be using for a different source.
+    if (mainVideo && mainVideo.videoWidth) {
+      const w = 160, h = Math.round(160 * (mainVideo.videoHeight / mainVideo.videoWidth));
+      offCanvas.width = w; offCanvas.height = h;
+      offCtx.drawImage(mainVideo, 0, 0, w, h);
+      try {
+        const thumb = offCanvas.toDataURL("image/jpeg", 0.6);
+        if (handle === "in") scene.trimThumbIn = thumb; else scene.trimThumbOut = thumb;
+      } catch (e) { /* tainted canvas (CORS source) -- leave existing thumb */ }
+      render();
+    }
   };
   window.addEventListener("mousemove", onMove);
   window.addEventListener("mouseup", onUp);
@@ -1274,6 +1333,11 @@ function TrimPanel() {
   const inPct = ((scene.trimIn - scene.start) / range) * 100;
   const outPct = ((scene.trimOut - scene.start) / range) * 100;
 
+  const mainVideo = document.getElementById("mainVideo");
+  const isScrubbing = !!state.trimDragHandle && mainVideo && sourceFor(scene) && mainVideo.dataset.loadedSourceId === String(sourceFor(scene).id);
+  const scrubTime = isScrubbing ? mainVideo.currentTime : null;
+  const scrubPct = isScrubbing ? Math.max(0, Math.min(100, ((scrubTime - scene.start) / range) * 100)) : null;
+
   return (
     <div class="trim-panel">
       <div class="trim-header">Trim Scene</div>
@@ -1286,6 +1350,12 @@ function TrimPanel() {
           <label>Out point</label>
           <div class="val">{fmt(scene.trimOut)}</div>
         </div>
+        {isScrubbing && (
+          <div class="field">
+            <label>Scrubbing</label>
+            <div class="val scrub-time">{fmt(scrubTime)}</div>
+          </div>
+        )}
         <div class="field">
           <label>Trimmed duration</label>
           <div class="val">{fmt(scene.trimOut - scene.trimIn)}</div>
@@ -1296,12 +1366,13 @@ function TrimPanel() {
         >
           {scene.thumb && (
             <div class="thumbs">
+              <img src={scene.trimThumbIn || scene.thumb} />
               <img src={scene.thumb} />
-              <img src={scene.thumb} />
-              <img src={scene.thumb} />
+              <img src={scene.trimThumbOut || scene.thumb} />
             </div>
           )}
           <div class="range" style={`left:${inPct}%; width:${outPct - inPct}%`}></div>
+          {isScrubbing && <div class="playhead2" style={`left:${scrubPct}%`}></div>}
           <div
             class="handle" style={`left:calc(${inPct}% - 5px)`}
             onmousedown={(e) => { e.stopPropagation(); beginTrimDrag("in", scene.id, document.getElementById("trimTrack")); }}
@@ -1313,6 +1384,11 @@ function TrimPanel() {
             ontouchstart={(e) => { e.stopPropagation(); beginTrimDrag("out", scene.id, document.getElementById("trimTrack")); }}
           ></div>
         </div>
+        {isScrubbing && (
+          <div class="scrub-preview">
+            <canvas id="scrubCanvas" width="280" height="158"></canvas>
+          </div>
+        )}
         <div class="trim-actions">
           <button onclick={() => resetTrim(scene.id)}>Reset trim</button>
           <button class="primary" onclick={() => {
