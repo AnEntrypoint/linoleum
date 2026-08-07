@@ -12,8 +12,9 @@ Open `index.html` in a browser. That's it — no `npm install`, no dev server.
 - **Automatic scene detection** — the source is scanned and split into scenes based on visual changes (color histogram / frame-diff analysis).
 - **Scene stack** — reorder scenes by drag-and-drop, toggle individual scenes on/off, and preview the assembled sequence.
 - **Trim panel** — adjust in/out points per scene against a live clip preview.
-- **Speech Only** — automatically re-cuts the enabled scenes down to just the segments containing speech, gating on signal level (dBFS) and padding each kept region so cuts don't clip word onsets/offsets.
+- **Speech Only** — automatically re-cuts the enabled scenes down to just the segments containing speech, gating on signal level (-14dBFS) and padding each kept region so cuts don't clip word onsets/offsets.
 - **Export** — renders the final sequence (video + audio, respecting trims, ordering, and enabled/disabled scenes) to a WebM file directly in-browser via `canvas.captureStream()` + `MediaRecorder`, with audio mixed through a shared `AudioContext`.
+- **Load-time normalization** — each source's audio is peak-normalized as soon as it's loaded, so the -14dBFS speech gate measures a consistent reference level regardless of how hot or quiet the original recording was; the same gain carries through to the exported mix.
 
 ## How it works
 
