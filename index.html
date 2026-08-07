@@ -457,6 +457,7 @@ function loadFile(file) {
   }
   const url = URL.createObjectURL(file);
   const source = addSource(url, file.name);
+  decodeSourceAudioMono44100(source).catch(() => {}); // kick off normalization; failures are fine, gating/export fall back to unity gain
   detectScenes(url, source.id, file.name).catch(err => {
     state.busy = false;
     state.status = "Error: " + err.message;
@@ -468,6 +469,7 @@ function loadURL(url) {
   if (!url) return;
   const name = url.split("/").pop().split("?")[0] || url;
   const source = addSource(url, name);
+  decodeSourceAudioMono44100(source).catch(() => {}); // kick off normalization; failures are fine, gating/export fall back to unity gain
   detectScenes(url, source.id, name).catch(err => {
     state.busy = false;
     state.status = "Error: " + err.message;
@@ -646,6 +648,28 @@ const SPEECH_MIN_GAP = 2 * SPEECH_PAD + 0.2;
 // reuse this instead of re-decoding/re-running RNNoise per scene.
 const decodedAudioCache = new Map(); // sourceId -> Promise<Float32Array | null>
 
+// Peak gain applied to each source's decoded analysis buffer, keyed by
+// source.id — export reuses this so the mixed-out audio matches what the
+// -14dB gate actually measured instead of the raw, un-normalized track.
+const sourceNormalizationGain = new Map(); // sourceId -> number
+
+// Peak-normalizes samples in place to target dBFS (0 = full scale) and
+// returns the applied linear gain. A silent/near-silent buffer is left
+// untouched (gain 1) rather than amplified toward infinity.
+function peakNormalize(samples, targetDb = 0) {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const abs = Math.abs(samples[i]);
+    if (abs > peak) peak = abs;
+  }
+  if (peak <= 0) return 1;
+  const targetPeak = Math.pow(10, targetDb / 20);
+  const gain = targetPeak / peak;
+  if (gain === 1) return 1;
+  for (let i = 0; i < samples.length; i++) samples[i] *= gain;
+  return gain;
+}
+
 async function decodeSourceAudioMono44100(source) {
   if (decodedAudioCache.has(source.id)) return decodedAudioCache.get(source.id);
 
@@ -674,7 +698,15 @@ async function decodeSourceAudioMono44100(source) {
     bufferSrc.connect(offlineCtx.destination);
     bufferSrc.start();
     const rendered = await offlineCtx.startRendering();
-    return rendered.getChannelData(0).slice(); // mono Float32Array @ 44100Hz
+    const mono = rendered.getChannelData(0).slice(); // mono Float32Array @ 44100Hz
+
+    // Normalize so the -14dB speech gate (SPEECH_DB_THRESHOLD) measures a
+    // consistent reference level regardless of how hot/quiet the source was
+    // recorded — otherwise a quiet source never crosses the gate and a hot
+    // one always does.
+    const gain = peakNormalize(mono, 0);
+    sourceNormalizationGain.set(source.id, gain);
+    return mono;
   })();
 
   decodedAudioCache.set(source.id, promise);
@@ -915,6 +947,8 @@ async function exportVideo() {
   const audioDest = audioCtx.createMediaStreamDestination();
   let sourceNode = null;
   let connectedEl = null;
+  const gainNode = audioCtx.createGain();
+  gainNode.connect(audioDest);
 
   const mixedStream = new MediaStream([
     ...canvasStream.getVideoTracks(),
@@ -955,9 +989,14 @@ async function exportVideo() {
         // so this connects on first use and is then reused across every scene/source
         // swap on this same element for the rest of the export.
         sourceNode = audioCtx.createMediaElementSource(exportVideoEl);
-        sourceNode.connect(audioDest);
+        sourceNode.connect(gainNode);
         connectedEl = exportVideoEl;
       }
+      // Apply the same peak-normalization gain the -14dB speech gate measured
+      // against at load (decodeSourceAudioMono44100) so the exported mix isn't
+      // left at the source's raw, un-normalized level. Falls back to unity gain
+      // for a source that was never analyzed (e.g. Speech Only was never run).
+      gainNode.gain.value = sourceNormalizationGain.get(src.id) ?? 1;
 
       exportVideoEl.currentTime = scene.trimIn;
       await new Promise((resolve) => { exportVideoEl.onseeked = resolve; });
