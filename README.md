@@ -8,7 +8,7 @@ Open `index.html` in a browser. That's it — no `npm install`, no dev server.
 
 ## Features
 
-- **Load a video** by file drop or URL.
+- **Load a video** by file drop or URL. Each import prompts for how to add it — load as-is (one uncut scene), split into scenes, or split and immediately run Speech Only — so raw and pre-processed clips can sit side by side in the same stack.
 - **Automatic scene detection** — the source is scanned and split into scenes based on visual changes (color histogram / frame-diff analysis).
 - **Scene stack** — reorder scenes by drag-and-drop, toggle individual scenes on/off, and preview the assembled sequence.
 - **Trim panel** — adjust in/out points per scene against a live clip preview.
