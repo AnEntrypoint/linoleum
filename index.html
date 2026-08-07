@@ -269,6 +269,14 @@ offVideo.preload = "auto";
 const offCanvas = document.createElement("canvas");
 const offCtx = offCanvas.getContext("2d", { willReadFrequently: true });
 
+// Separate canvas for thumbnail capture during the detection sweep, so
+// grabFrameData's per-sample diff-analysis size and grabThumbFrame's larger
+// thumbnail size don't thrash the same canvas's dimensions (a canvas resize
+// clears its content, so doing both back-to-back on offCanvas would resize
+// it twice per sample for no reason).
+const thumbCanvas = document.createElement("canvas");
+const thumbCtx = thumbCanvas.getContext("2d");
+
 function seekOff(t) {
   return new Promise((resolve) => {
     const onSeeked = () => {
@@ -301,13 +309,19 @@ function colorHistogram(data) {
   // describe the overall color distribution of a frame while ignoring WHERE
   // colors sit spatially — this makes the comparison robust to camera pans,
   // handheld shake, and motion within a shot, which a raw per-pixel diff is not.
+  //
+  // HIST_BINS is 16 = 256 >> 4, so bin index is a right-shift, not a divide --
+  // a real per-pixel cost cut confirmed by profiling (colorHistogram was the
+  // single largest self-time cost after the seek->RVFC rewrite eliminated the
+  // seek overhead that used to dominate). An 8-bit channel value's top 4 bits
+  // (0-255 >> 4 = 0-15) always land in range, so the old Math.min clamp never
+  // actually fired and is dropped.
   const hist = new Float32Array(HIST_BINS * 3);
-  const binWidth = 256 / HIST_BINS;
   let count = 0;
   for (let i = 0; i < data.length; i += 4) {
-    hist[Math.min(HIST_BINS - 1, (data[i] / binWidth) | 0)]++;
-    hist[HIST_BINS + Math.min(HIST_BINS - 1, (data[i + 1] / binWidth) | 0)]++;
-    hist[HIST_BINS * 2 + Math.min(HIST_BINS - 1, (data[i + 2] / binWidth) | 0)]++;
+    hist[data[i] >> 4]++;
+    hist[HIST_BINS + (data[i + 1] >> 4)]++;
+    hist[HIST_BINS * 2 + (data[i + 2] >> 4)]++;
     count++;
   }
   for (let i = 0; i < hist.length; i++) hist[i] /= count;
@@ -338,6 +352,122 @@ function thumbAt(t) {
 
 /* ---------------- Scene detection ---------------- */
 
+const SAMPLE_FPS = 4; // samples per second for diffing
+const THUMB_W = 160; // thumbnail-quality capture width, grabbed during the sweep
+const THUMB_SAMPLE_GAP = 0.5; // seconds between thumbnail captures during the sweep -- coarser than SAMPLE_FPS since only one thumb per scene is ever used, and MIN_LEN (1.2s) guarantees a nearby candidate for every scene
+
+// Sweeps offVideo through [0, duration) ONCE via a fast muted playback pass,
+// sampling frames with requestVideoFrameCallback instead of the old
+// seek-per-sample approach (one real seek+decode round-trip per sample,
+// ~4/sec, which a Chrome performance trace against the deployed build
+// confirmed as the dominant cost for long-video import: drawImage/onSeeked
+// were the top CPU-profile hotspots). RVFC fires at native frame rate as the
+// video plays through, avoiding the keyframe-seek decode cost seeking pays
+// on every call. Playback runs at an elevated rate where the browser allows
+// it (offVideo is already muted, so audio-mute-at-speed is a non-issue) to
+// shorten the sweep further. Falls back to 1x if the browser rejects a
+// higher playbackRate outright (some engines throw on very high multiples).
+// Captures a thumbnail-quality frame (THUMB_W wide) alongside every kept
+// diff sample so a second seek-per-scene thumbnail pass isn't needed
+// afterward -- capture-thumbnails-during-detection-sweep.
+async function sweepVideoFrames(duration, w, h, onSample) {
+  const hasRVFC = typeof offVideo.requestVideoFrameCallback === "function";
+  if (!hasRVFC) {
+    // Older/non-Chromium engine without RVFC support -- fall back to the
+    // original seek-per-sample loop, still correct just slower.
+    const sampleInterval = 1 / SAMPLE_FPS;
+    const totalSamples = Math.max(2, Math.floor(duration / sampleInterval));
+    for (let i = 0; i < totalSamples; i++) {
+      const t = Math.min(duration - 0.02, i * sampleInterval);
+      await seekOff(t);
+      let data, thumb;
+      try {
+        data = grabFrameData(w, h);
+        thumb = grabThumbFrame();
+      } catch (e) {
+        if (e instanceof TaintedCanvasError) return { corsBlocked: true };
+        throw e;
+      }
+      onSample(t, data, thumb, (i + 1) / totalSamples);
+    }
+    return { corsBlocked: false };
+  }
+
+  offVideo.currentTime = 0;
+  offVideo.playbackRate = 8; // muted; browsers commonly cap effective decode throughput below this, which is fine -- it only sets an upper bound
+  const minSampleGap = 1 / SAMPLE_FPS;
+  // grabThumbFrame is far more expensive to skip needlessly than grabFrameData
+  // would suggest at a glance -- a second profile (Firefox) taken after the
+  // seek->RVFC rewrite showed grabFrameData and grabThumbFrame as the two
+  // remaining hot paths inside onFrame, both running once per diff-sample.
+  // Only ONE thumbnail per detected scene is ever actually used (nearest to
+  // that scene's midpoint), so capturing one on every diff-sample (up to
+  // SAMPLE_FPS/sec) is mostly wasted work -- capture at a much coarser
+  // interval instead, well under MIN_LEN (1.2s, the shortest a scene can be)
+  // so every scene still has at least one nearby candidate.
+  let lastSampledAt = -Infinity;
+  let lastThumbAt = -Infinity;
+  let corsBlocked = false;
+  let sawTaintedError = false;
+
+  await new Promise((resolve, reject) => {
+    const onFrame = (now, metadata) => {
+      if (sawTaintedError || offVideo.ended || offVideo.currentTime >= duration - 0.02) {
+        resolve();
+        return;
+      }
+      const t = metadata.mediaTime;
+      if (t - lastSampledAt >= minSampleGap) {
+        lastSampledAt = t;
+        try {
+          const data = grabFrameData(w, h);
+          let thumb = null;
+          if (t - lastThumbAt >= THUMB_SAMPLE_GAP) {
+            lastThumbAt = t;
+            thumb = grabThumbFrame();
+          }
+          onSample(t, data, thumb, Math.min(1, t / duration));
+        } catch (e) {
+          if (e instanceof TaintedCanvasError) {
+            corsBlocked = true;
+            sawTaintedError = true;
+            resolve();
+            return;
+          }
+          reject(e);
+          return;
+        }
+      }
+      offVideo.requestVideoFrameCallback(onFrame);
+    };
+    offVideo.requestVideoFrameCallback(onFrame);
+    offVideo.play().catch((e) => {
+      // Some engines reject an elevated playbackRate outright rather than
+      // silently clamping it -- retry once at normal speed before giving up.
+      if (offVideo.playbackRate !== 1) {
+        offVideo.playbackRate = 1;
+        offVideo.play().catch(reject);
+      } else {
+        reject(e);
+      }
+    });
+  });
+
+  offVideo.pause();
+  return { corsBlocked };
+}
+
+function grabThumbFrame() {
+  const w = THUMB_W, h = Math.round(THUMB_W * (offVideo.videoHeight / offVideo.videoWidth || 0.5625));
+  if (thumbCanvas.width !== w || thumbCanvas.height !== h) { thumbCanvas.width = w; thumbCanvas.height = h; }
+  thumbCtx.drawImage(offVideo, 0, 0, w, h);
+  try {
+    return thumbCanvas.toDataURL("image/jpeg", 0.6);
+  } catch (e) {
+    return null; // tainted canvas -- thumbnails just stay null, not fatal
+  }
+}
+
 async function detectScenes(url, sourceId, sourceLabel) {
   state.busy = true;
   state.progress = 0;
@@ -358,36 +488,26 @@ async function detectScenes(url, sourceId, sourceLabel) {
     source.height = offVideo.videoHeight;
   }
 
-  const SAMPLE_FPS = 4; // samples per second for diffing
-  const sampleInterval = 1 / SAMPLE_FPS;
-  const totalSamples = Math.max(2, Math.floor(duration / sampleInterval));
   const w = 96, h = Math.round(96 * (offVideo.videoHeight / offVideo.videoWidth || 0.5625));
 
   let prevData = null;
-  let corsBlocked = false;
   const samples = []; // {t, diff}
+  const thumbSamples = []; // {t, thumb} -- reused for capture-thumbnails-during-detection-sweep
+  let lastRenderAt = 0;
 
-  for (let i = 0; i < totalSamples; i++) {
-    const t = Math.min(duration - 0.02, i * sampleInterval);
-    await seekOff(t);
-    let data;
-    try {
-      data = grabFrameData(w, h);
-    } catch (e) {
-      if (e instanceof TaintedCanvasError) {
-        corsBlocked = true;
-        break;
-      }
-      throw e;
-    }
-    if (prevData) {
-      samples.push({ t, diff: frameDiff(prevData, data) });
-    }
+  const { corsBlocked } = await sweepVideoFrames(duration, w, h, (t, data, thumb, frac) => {
+    if (prevData) samples.push({ t, diff: frameDiff(prevData, data) });
     prevData = data;
-    state.progress = Math.round(((i + 1) / totalSamples) * 100);
+    if (thumb) thumbSamples.push({ t, thumb });
+    state.progress = Math.round(frac * 100);
     state.status = `Analyzing ${sourceLabel}... ${state.progress}%`;
-    if (i % 3 === 0) render();
-  }
+    // Throttle renders to roughly every 150ms of wall-clock rather than every
+    // sample -- RVFC can fire far more often than the old 3-samples-per-render
+    // cadence assumed, and re-rendering the whole tree on every frame would
+    // itself become a bottleneck during the now much-faster sweep.
+    const now = performance.now();
+    if (now - lastRenderAt > 150) { lastRenderAt = now; render(); }
+  });
 
   let cutTimes = [0];
 
@@ -446,12 +566,26 @@ async function detectScenes(url, sourceId, sourceLabel) {
     });
   }
 
+  // Reuses the thumbnail-quality frames captured during the sweep instead of
+  // seeking again per scene (capture-thumbnails-during-detection-sweep) --
+  // picks whichever sampled frame lands closest to each scene's target
+  // midpoint. Falls back to a single targeted seek (thumbAt) only for a
+  // scene whose nearest sample isn't close enough to be representative
+  // (corsBlocked skips the sweep entirely, or a scene shorter than one
+  // sample interval could have no nearby sample), so long-video imports
+  // with many scenes don't regress to one seek per scene.
   state.status = `Generating thumbnails for ${sourceLabel}...`;
   render();
 
+  const THUMB_MATCH_TOLERANCE = THUMB_SAMPLE_GAP; // a sample this close to the target time is close enough to reuse
   for (let i = 0; i < scenes.length; i++) {
     const mid = scenes[i].start + Math.min(0.15, (scenes[i].end - scenes[i].start) / 3);
-    scenes[i].thumb = await thumbAt(mid);
+    let best = null, bestDist = Infinity;
+    for (const s of thumbSamples) {
+      const dist = Math.abs(s.t - mid);
+      if (dist < bestDist) { best = s; bestDist = dist; }
+    }
+    scenes[i].thumb = best && bestDist <= THUMB_MATCH_TOLERANCE ? best.thumb : await thumbAt(mid);
     state.progress = Math.round(((i + 1) / scenes.length) * 100);
     render();
   }
