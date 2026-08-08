@@ -220,6 +220,16 @@ const CANVAS_RATIOS = [
   { id: "4:3", w: 4, h: 3, label: "4:3 Classic" },
 ];
 
+// The set of choices offered by the per-import mode modal. Centralized here
+// (instead of the mode id string being repeated separately in the modal's
+// buttons and in resolvePendingImport's branching) so a typo in one place
+// can't silently no-op a mode instead of erroring.
+const IMPORT_MODES = [
+  { id: "asis", title: "Load as-is", desc: "One scene spanning the whole clip, no cuts." },
+  { id: "split", title: "Split into scenes", desc: "Auto-detect cuts and break the clip into scenes." },
+  { id: "split-speech", title: "Split + Mark Speech", desc: "Auto-detect cuts, then split each scene into speech and silence segments — silence stays in the stack, highlighted red." },
+];
+
 const state = {
   sources: [],          // {id, url, name, width, height} — one entry per loaded video file/URL
   status: "Drop a video file or paste a URL to begin",
@@ -316,6 +326,19 @@ const nextId = () => uid++;
 function sourceFor(sceneOrId) {
   const scene = typeof sceneOrId === "object" ? sceneOrId : state.scenes.find(s => s.id === sceneOrId);
   return scene ? state.sources.find(src => src.id === scene.sourceId) : null;
+}
+
+function getScene(id) {
+  return state.scenes.find(s => s.id === id) || null;
+}
+
+// webjsx's diffing can replace the <video id="mainVideo"> DOM node across
+// renders, so every caller must re-look it up fresh rather than cache a
+// reference (see the safe pattern documented at syncActiveVideo/beginTrimDrag).
+// Centralized here so that invariant lives in one place instead of being
+// re-documented at every call site.
+function mainVideoEl() {
+  return document.getElementById("mainVideo");
 }
 
 /* ---------------- Offscreen helpers ---------------- */
@@ -735,7 +758,7 @@ function addSource(url, name) {
 // Stages a file/URL for import: creates the source, but defers BOTH scene
 // creation and audio decode until the user picks an import mode via the
 // pending-import modal. decodeSourceAudioMono44100 is only ever triggered
-// on-demand from inside speechOnlyEdit when Speech Only actually runs
+// on-demand from inside speechSplitEdit when Speech Only actually runs
 // (never speculatively here) -- for a large file, eagerly decoding the
 // entire audio track (full-file ArrayBuffer + native-samplerate AudioBuffer
 // + a re-rendered 44100Hz buffer + a copy of that) concurrently with
@@ -765,6 +788,7 @@ function loadURL(url) {
 }
 
 // Runs the chosen import mode for the staged pendingImport, then clears it.
+// mode is one of IMPORT_MODES' ids ("asis" | "split" | "split-speech").
 async function resolvePendingImport(mode) {
   const pending = state.pendingImport;
   if (!pending) return;
@@ -778,7 +802,7 @@ async function resolvePendingImport(mode) {
     } else {
       newScenes = await detectScenes(pending.url, pending.sourceId, pending.name);
       if (mode === "split-speech" && newScenes && newScenes.length) {
-        await speechOnlyEdit(newScenes.map(s => s.id));
+        await speechSplitEdit(newScenes.map(s => s.id));
       }
     }
   } catch (err) {
@@ -792,7 +816,7 @@ async function resolvePendingImport(mode) {
 
 function orderedScenes() {
   return state.order
-    .map(id => state.scenes.find(s => s.id === id))
+    .map(id => getScene(id))
     .filter(Boolean);
 }
 
@@ -813,7 +837,7 @@ function moveScene(dragId, dropId) {
 }
 
 function toggleScene(id) {
-  const s = state.scenes.find(s => s.id === id);
+  const s = getScene(id);
   if (s) s.enabled = !s.enabled;
   render();
 }
@@ -852,8 +876,8 @@ function ensureVideoSource(mainVideo, scene) {
 function selectScene(id) {
   state.activeSceneId = id;
   state.isPlaying = false;
-  const s = state.scenes.find(s => s.id === id);
-  const mainVideo = document.getElementById("mainVideo");
+  const s = getScene(id);
+  const mainVideo = mainVideoEl();
   if (s && mainVideo) {
     mainVideo.pause();
     ensureVideoSource(mainVideo, s).then(() => { mainVideo.currentTime = s.trimIn; });
@@ -885,7 +909,7 @@ function playFromCurrentPosition() {
     return;
   }
   const scene = list[index];
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   const parkedTime = mainVideo && mainVideo.dataset.loadedSourceId === String(sourceFor(scene) && sourceFor(scene).id)
     ? mainVideo.currentTime
     : scene.trimIn;
@@ -925,7 +949,7 @@ let cancelBoundaryWatch = null;
 async function playCurrentSegment(startTime = null) {
   const list = enabledOrderedScenes();
   const scene = list[state.playingIndex];
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   if (!scene || !mainVideo) { stopPlayback(); return; }
   state.activeSceneId = scene.id;
   await ensureVideoSource(mainVideo, scene);
@@ -971,7 +995,7 @@ function seekToSequenceTime(seqTime) {
   const scene = list[index];
   const target = scene.trimIn + t;
   state.activeSceneId = scene.id;
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   if (state.isPlaying) {
     state.playingIndex = index;
     ensureVideoSource(mainVideo, scene).then(() => {
@@ -1020,7 +1044,7 @@ function stopPlayback() {
   state.isPlaying = false;
   state.playingIndex = -1;
   if (cancelBoundaryWatch) { cancelBoundaryWatch(); cancelBoundaryWatch = null; }
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   if (mainVideo) mainVideo.pause();
   render();
 }
@@ -1090,8 +1114,18 @@ async function decodeSourceAudioMono44100(source) {
   if (decodedAudioCache.has(source.id)) return decodedAudioCache.get(source.id);
 
   const promise = (async () => {
-    const resp = await fetch(source.url);
-    const arrayBuffer = await resp.arrayBuffer();
+    let arrayBuffer;
+    try {
+      const resp = await fetch(source.url);
+      if (!resp.ok) throw new Error(`fetch failed: ${resp.status}`);
+      arrayBuffer = await resp.arrayBuffer();
+    } catch (e) {
+      // A transient network failure shouldn't permanently poison the cache --
+      // evict this rejected entry so the next call retries instead of reusing
+      // a dead promise forever.
+      decodedAudioCache.delete(source.id);
+      throw e;
+    }
     const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
     let audioBuffer;
     try {
@@ -1165,7 +1199,7 @@ async function decodeSourceAudioMono44100(source) {
 // itself stays correct indefinitely, only its free/destroy path is unsafe
 // after sustained use). Since this runs once per scene, creating-and-destroying
 // per scene would hit that crash on any multi-scene edit. The fix: the caller
-// creates ONE processor for the whole speechOnlyEdit() run and never destroys
+// creates ONE processor for the whole speechSplitEdit() run and never destroys
 // it — WASM memory for a single page-lifetime instance is not a real leak risk.
 async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
   const REQUIRED_HZ = 44100;
@@ -1250,7 +1284,7 @@ function speechAndSilenceRanges(regions, rangeStart, rangeEnd) {
   return ranges;
 }
 
-async function speechOnlyEdit(sceneIds = null) {
+async function speechSplitEdit(sceneIds = null) {
   const scenesToProcess = sceneIds
     ? orderedScenes().filter(s => sceneIds.includes(s.id) && s.enabled)
     : orderedScenes().filter(s => s.enabled);
@@ -1291,7 +1325,14 @@ async function speechOnlyEdit(sceneIds = null) {
       rejectedTooShortIds.add(scene.id);
       continue;
     }
-    const samples = await decodeSourceAudioMono44100(src);
+    let samples;
+    try {
+      samples = await decodeSourceAudioMono44100(src);
+    } catch (e) {
+      // Network/decode failure -- treat like "no audio track" rather than
+      // aborting the whole batch; the scene is kept as silence, untouched.
+      samples = null;
+    }
     if (!samples) {
       // No audio track at all on this clip -- the whole scene counts as silence,
       // kept in the stack and highlighted rather than dropped.
@@ -1335,6 +1376,16 @@ async function speechOnlyEdit(sceneIds = null) {
   // Replace only the scenes that were actually processed, preserving the
   // position of any disabled scenes AND any too-short rejected scenes
   // (rejectedTooShortIds) left untouched in the stack.
+  //
+  // All newly split scenes are inserted as one contiguous block at the FIRST
+  // processed scene's position in state.order -- this only reproduces the
+  // original layout when the processed scenes were themselves contiguous in
+  // the stack. If the caller passes a non-contiguous sceneIds selection (e.g.
+  // the user reordered scenes so processed and untouched scenes interleave),
+  // the split results still collapse into one block, silently changing the
+  // stack's interleaving. Nothing currently constructs a non-contiguous
+  // selection (sceneIds is always a fresh detectScenes() batch or the whole
+  // enabled set), so this is a latent assumption rather than an observed bug.
   const processedIds = new Set(scenesToProcess.filter(s => !rejectedTooShortIds.has(s.id)).map(s => s.id));
   const rebuiltOrder = [];
   const rebuiltScenes = state.scenes.filter(s => !processedIds.has(s.id));
@@ -1532,7 +1583,7 @@ async function exportVideo() {
 // frame rather than racing ahead of the decoder on every mousemove tick.
 function drawScrubPreview() {
   const canvas = document.getElementById("scrubCanvas");
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   if (!canvas || !mainVideo || !mainVideo.videoWidth) return;
   const ctx = canvas.getContext("2d");
   const vw = mainVideo.videoWidth, vh = mainVideo.videoHeight;
@@ -1554,7 +1605,7 @@ function drawScrubPreview() {
 // getBoundingClientRect() computed against a stale/removed track element.
 function beginTrimDrag(handle, sceneId) {
   state.trimDragHandle = handle;
-  const scene = state.scenes.find(s => s.id === sceneId);
+  const scene = getScene(sceneId);
   if (!scene) return;
 
   let pendingFrac = null;
@@ -1577,7 +1628,7 @@ function beginTrimDrag(handle, sceneId) {
       scene.trimOut = Math.max(t, scene.trimIn + 0.05);
       scene.trimOut = Math.min(scene.end, scene.trimOut);
     }
-    const mainVideo = document.getElementById("mainVideo");
+    const mainVideo = mainVideoEl();
     if (mainVideo) {
       mainVideo.currentTime = handle === "in" ? scene.trimIn : scene.trimOut;
       ensureSeekedListener(mainVideo);
@@ -1610,7 +1661,7 @@ function beginTrimDrag(handle, sceneId) {
     }
   };
 
-  const initialVideo = document.getElementById("mainVideo");
+  const initialVideo = mainVideoEl();
   if (initialVideo) ensureSeekedListener(initialVideo);
 
   const onUp = () => {
@@ -1625,7 +1676,7 @@ function beginTrimDrag(handle, sceneId) {
     // original detection-time frame. Reads directly off mainVideo (already seeked
     // to trimIn/trimOut by flush() above) rather than the shared offVideo/offCanvas
     // singleton, which detectScenes/loadAsyncIs may be using for a different source.
-    const mainVideo = document.getElementById("mainVideo");
+    const mainVideo = mainVideoEl();
     if (mainVideo && mainVideo.videoWidth) {
       const w = 160, h = Math.round(160 * (mainVideo.videoHeight / mainVideo.videoWidth));
       offCanvas.width = w; offCanvas.height = h;
@@ -1647,13 +1698,13 @@ function beginTrimDrag(handle, sceneId) {
 }
 
 function resetTrim(sceneId) {
-  const s = state.scenes.find(s => s.id === sceneId);
+  const s = getScene(sceneId);
   if (s) { s.trimIn = s.start; s.trimOut = s.end; }
   render();
 }
 
 function setSceneFit(sceneId, fit) {
-  const s = state.scenes.find(s => s.id === sceneId);
+  const s = getScene(sceneId);
   if (s) s.fit = fit;
   render();
 }
@@ -1708,7 +1759,7 @@ function Timeline() {
     for (let i = 0; i < state.playingIndex; i++) {
       playedUpTo += enabled[i].trimOut - enabled[i].trimIn;
     }
-    const mainVideo = document.getElementById("mainVideo");
+    const mainVideo = mainVideoEl();
     const cur = enabled[state.playingIndex];
     if (mainVideo && cur) playedUpTo += Math.max(0, mainVideo.currentTime - cur.trimIn);
   }
@@ -1719,7 +1770,8 @@ function Timeline() {
       <div class="timeline" onmousedown={beginTimelineScrub}>
         {list.filter(s => s.enabled).map(s => {
           const w = ((s.trimOut - s.trimIn) / total) * 100;
-          return <div class="seg" style={`width:${w}%; background:${colorFor(s.id)}`}></div>;
+          const bg = s.isSilence ? "repeating-linear-gradient(45deg, var(--danger), var(--danger) 4px, transparent 4px, transparent 8px)" : colorFor(s.id);
+          return <div class={`seg ${s.isSilence ? "silence" : ""}`} title={s.isSilence ? "Silence" : ""} style={`width:${w}%; background:${bg}`}></div>;
         })}
         <div class="playhead" style={`left:${playheadPct}%`}></div>
       </div>
@@ -1741,7 +1793,7 @@ function colorFor(id) {
 }
 
 function TrimPanel() {
-  const scene = state.scenes.find(s => s.id === state.activeSceneId);
+  const scene = getScene(state.activeSceneId);
   if (!scene) {
     return <div class="trim-panel"><div class="trim-header">Trim</div><div class="trim-empty">Select a scene to edit its in/out points.</div></div>;
   }
@@ -1749,7 +1801,7 @@ function TrimPanel() {
   const inPct = ((scene.trimIn - scene.start) / range) * 100;
   const outPct = ((scene.trimOut - scene.start) / range) * 100;
 
-  const mainVideo = document.getElementById("mainVideo");
+  const mainVideo = mainVideoEl();
   const isScrubbing = !!state.trimDragHandle && mainVideo && sourceFor(scene) && mainVideo.dataset.loadedSourceId === String(sourceFor(scene).id);
   const scrubTime = isScrubbing ? mainVideo.currentTime : null;
   const scrubPct = isScrubbing ? Math.max(0, Math.min(100, ((scrubTime - scene.start) / range) * 100)) : null;
@@ -1808,7 +1860,7 @@ function TrimPanel() {
         <div class="trim-actions">
           <button onclick={() => resetTrim(scene.id)}>Reset trim</button>
           <button class="primary" onclick={() => {
-            const mainVideo = document.getElementById("mainVideo");
+            const mainVideo = mainVideoEl();
             if (mainVideo) { mainVideo.pause(); mainVideo.currentTime = scene.trimIn; mainVideo.play(); }
           }}>Preview clip</button>
         </div>
@@ -1832,7 +1884,7 @@ function TrimPanel() {
 
 function App() {
   const list = orderedScenes();
-  const activeScene = state.scenes.find(s => s.id === state.activeSceneId);
+  const activeScene = getScene(state.activeSceneId);
 
   return (
     <div class="root" style="display:contents">
@@ -1866,7 +1918,7 @@ function App() {
         <div class="sep"></div>
         <button class="speech-btn" title="Split all clips into speech and silence segments (RNNoise VAD) — silence stays in the stack, highlighted red"
           disabled={!list.filter(s => s.enabled).length || state.speechScanning || state.exporting}
-          onclick={() => speechOnlyEdit()}>
+          onclick={() => speechSplitEdit()}>
           {state.speechScanning ? `Screening... ${state.speechScanProgress}%` : "Mark Speech"}
         </button>
         <div class="sep"></div>
@@ -1902,7 +1954,7 @@ function App() {
             {!state.scenes.length && <div class="empty-hint">Load a video to begin scene detection.<br/>Scenes will appear in the stack on the left.</div>}
           </div>
           <div class="transport">
-            <button class={state.isPlaying ? "" : "play"} onclick={togglePlay} title={state.isPlaying ? "Stop" : "Play sequence"}>
+            <button class={state.isPlaying ? "" : "play"} onclick={togglePlay} title={state.isPlaying ? "Stop" : "Play sequence"} aria-label={state.isPlaying ? "Stop" : "Play sequence"}>
               {state.isPlaying ? "■" : "▶"}
             </button>
             {Timeline()}
@@ -1923,18 +1975,12 @@ function ImportModeModal() {
       <div class="modal">
         <div class="modal-title">How should "{name}" be added?</div>
         <div class="modal-options">
-          <button class="modal-option" onclick={() => resolvePendingImport("asis")}>
-            <div class="modal-option-title">Load as-is</div>
-            <div class="modal-option-desc">One scene spanning the whole clip, no cuts.</div>
-          </button>
-          <button class="modal-option" onclick={() => resolvePendingImport("split")}>
-            <div class="modal-option-title">Split into scenes</div>
-            <div class="modal-option-desc">Auto-detect cuts and break the clip into scenes.</div>
-          </button>
-          <button class="modal-option" onclick={() => resolvePendingImport("split-speech")}>
-            <div class="modal-option-title">Split + Mark Speech</div>
-            <div class="modal-option-desc">Auto-detect cuts, then split each scene into speech and silence segments — silence stays in the stack, highlighted red.</div>
-          </button>
+          {IMPORT_MODES.map(m => (
+            <button class="modal-option" onclick={() => resolvePendingImport(m.id)}>
+              <div class="modal-option-title">{m.title}</div>
+              <div class="modal-option-desc">{m.desc}</div>
+            </button>
+          ))}
         </div>
       </div>
     </div>
@@ -1967,8 +2013,8 @@ function updateSweepProgressDOM() {
 // the source/seek themselves and would fight a concurrent sync here.
 function syncActiveVideo() {
   if (state.isPlaying || state.trimDragHandle) return;
-  const mainVideo = document.getElementById("mainVideo");
-  const scene = state.scenes.find(s => s.id === state.activeSceneId);
+  const mainVideo = mainVideoEl();
+  const scene = getScene(state.activeSceneId);
   if (!mainVideo || !scene) return;
   const src = sourceFor(scene);
   if (!src || (mainVideo.dataset.loadedSourceId === String(src.id) && mainVideo.src)) return;
