@@ -109,6 +109,15 @@
   .timeline .playhead{position:absolute; top:-3px; width:2px; height:14px; background:#fff; pointer-events:none;}
   .timeline-labels{display:flex; justify-content:space-between; font-size:11px; color:var(--sub);}
 
+  /* OVERLAY TRACKS B/C + AUDIO METER */
+  .overlay-canvas{position:absolute; inset:0; max-width:100%; max-height:100%; margin:auto; pointer-events:none;}
+  .offscreen-track-video{display:none;}
+  .level-meter{width:70px; height:14px; border-radius:3px; border:1px solid var(--border); flex-shrink:0;}
+  .track-row{display:flex; align-items:center; gap:10px; padding:6px 16px; background:var(--panel); border-top:1px solid var(--border);}
+  .track-label{width:16px; flex-shrink:0; font-size:11px; font-weight:700; color:var(--sub); text-align:center;}
+  .timeline-bc{position:relative; height:14px; background:var(--panel2); border-radius:4px; flex:1;}
+  .seg-bc{position:absolute; top:0; height:100%; border-radius:3px; cursor:grab; box-shadow:inset 0 0 0 1px var(--bg);}
+
   /* RIGHT TRIM PANEL */
   .trim-panel{
     width:320px; flex-shrink:0; background:var(--panel); border-left:1px solid var(--border);
@@ -248,6 +257,17 @@ const state = {
   speechScanning: false,
   speechScanProgress: 0,
   pendingImport: null, // {kind: 'file'|'url', file, url, name} — awaiting an import-mode choice
+
+  // Overlay tracks B and C: simultaneous clips composited over/mixed into
+  // track A (state.scenes/order above) during preview and export. Deliberately
+  // a separate, simpler subsystem rather than a generalized "N tracks" model --
+  // track A's playback/export/undo/drag code is mature and untouched; B/C reuse
+  // its scene shape ({id, sourceId, start, end, trimIn, trimOut, enabled, thumb,
+  // fit}) but have their own state and their own (lighter-weight) UI/sync code.
+  tracksBC: {
+    B: { scenes: [], order: [] },
+    C: { scenes: [], order: [] },
+  },
 };
 
 /* ---------------- Undo/redo: 50-step history over {scenes, order, activeSceneId} ---------------- */
@@ -265,7 +285,7 @@ let lastSnapshotJSON = null;
 let restoringHistory = false; // true while applying an undo/redo, so it isn't re-captured as a new step
 
 function snapshotUndoSlice() {
-  return { scenes: state.scenes, order: state.order, activeSceneId: state.activeSceneId };
+  return { scenes: state.scenes, order: state.order, activeSceneId: state.activeSceneId, tracksBC: state.tracksBC };
 }
 
 function captureHistoryIfChanged() {
@@ -289,6 +309,11 @@ function applyHistorySnapshot(snap) {
   state.scenes = JSON.parse(JSON.stringify(snap.scenes));
   state.order = snap.order.slice();
   state.activeSceneId = snap.activeSceneId;
+  // Older history entries captured before tracksBC existed won't have it --
+  // fall back to empty tracks rather than leaving state.tracksBC undefined.
+  state.tracksBC = snap.tracksBC
+    ? JSON.parse(JSON.stringify(snap.tracksBC))
+    : { B: { scenes: [], order: [] }, C: { scenes: [], order: [] } };
   lastSnapshotJSON = JSON.stringify(snap);
   render();
   restoringHistory = false;
@@ -339,6 +364,12 @@ function getScene(id) {
 // re-documented at every call site.
 function mainVideoEl() {
   return document.getElementById("mainVideo");
+}
+
+// Same re-fetch-fresh rationale as mainVideoEl() -- trackVideoB/trackVideoC
+// are separate DOM elements webjsx can also replace across renders.
+function trackVideoEl(trackId) {
+  return document.getElementById(trackId === "B" ? "trackVideoB" : "trackVideoC");
 }
 
 /* ---------------- Offscreen helpers ---------------- */
@@ -836,6 +867,75 @@ function moveScene(dragId, dropId) {
   render();
 }
 
+/* ---------------- Overlay tracks B/C ---------------- */
+
+function trackBCState(trackId) {
+  return state.tracksBC[trackId] || null;
+}
+
+function orderedScenesBC(trackId) {
+  const t = trackBCState(trackId);
+  if (!t) return [];
+  return t.order.map(id => t.scenes.find(s => s.id === id)).filter(Boolean);
+}
+
+function getSceneBC(trackId, id) {
+  const t = trackBCState(trackId);
+  return (t && t.scenes.find(s => s.id === id)) || null;
+}
+
+function moveSceneBC(trackId, dragId, dropId) {
+  const t = trackBCState(trackId);
+  if (!t || dragId === dropId) return;
+  const order = t.order.slice();
+  const from = order.indexOf(dragId);
+  const to = order.indexOf(dropId);
+  if (from < 0 || to < 0) return;
+  order.splice(from, 1);
+  order.splice(to, 0, dragId);
+  t.order = order;
+  render();
+}
+
+function toggleSceneBC(trackId, id) {
+  const s = getSceneBC(trackId, id);
+  if (s) s.enabled = !s.enabled;
+  render();
+}
+
+function removeSceneBC(trackId, id) {
+  const t = trackBCState(trackId);
+  if (!t) return;
+  t.scenes = t.scenes.filter(s => s.id !== id);
+  t.order = t.order.filter(x => x !== id);
+  render();
+}
+
+// Copies a track-A scene onto track B or C at its own current timeline
+// position (same start/trimIn/trimOut as the source scene), so it lines up
+// under whatever's already on A at that point. The scene keeps its own
+// independent id/enabled/trim state from then on -- moving it is a copy, not
+// a relink, since a scene object can only belong to one track's array.
+function copySceneToTrack(sceneId, trackId) {
+  const source = getScene(sceneId);
+  const t = trackBCState(trackId);
+  if (!source || !t) return;
+  const copy = {
+    id: nextId(),
+    sourceId: source.sourceId,
+    start: source.start,
+    end: source.end,
+    trimIn: source.trimIn,
+    trimOut: source.trimOut,
+    enabled: true,
+    thumb: source.thumb,
+    fit: source.fit,
+  };
+  t.scenes = t.scenes.concat([copy]);
+  t.order = t.order.concat([copy.id]);
+  render();
+}
+
 function toggleScene(id) {
   const s = getScene(id);
   if (s) s.enabled = !s.enabled;
@@ -871,6 +971,64 @@ function ensureVideoSource(mainVideo, scene) {
     mainVideo.dataset.loadedSourceId = String(src.id);
     mainVideo.onloadedmetadata = () => resolve();
   });
+}
+
+// B/C scenes reference track A's state.sources the same way A's own scenes
+// do, so this reuses sourceFor by constructing the same {sourceId} shape
+// ensureVideoSource expects; kept as a separate function (not a trackId
+// parameter on ensureVideoSource) since B/C scenes live in a different array
+// that sourceFor doesn't search.
+function ensureVideoSourceBC(videoEl, scene) {
+  const src = state.sources.find(s => s.id === scene.sourceId);
+  if (!src) return Promise.resolve();
+  if (videoEl.dataset.loadedSourceId === String(src.id) && videoEl.src) return Promise.resolve();
+  return new Promise((resolve) => {
+    videoEl.src = src.url;
+    videoEl.dataset.loadedSourceId = String(src.id);
+    videoEl.onloadedmetadata = () => resolve();
+  });
+}
+
+// Called from track A's playback tick (watchSceneBoundary's onFrame, the only
+// per-frame "clock" the app has) with the current position expressed as
+// sequence-time-within-track-A. For each of B/C, finds whichever of that
+// track's OWN enabled scenes overlaps this same absolute source-relative
+// position (tracks share track A's start/end absolute time axis, not a
+// separate one), and seeks/plays or pauses/hides that track's video element
+// to match. This is a best-effort per-tick sync, not a hard frame-lock --
+// acceptable for a preview/export tool with no professional-grade genlock
+// requirement, and it reuses the exact same rAF cadence track A already
+// polls at, so it never drifts far.
+function syncTracksBC(sequenceTimeOnA) {
+  const listA = enabledOrderedScenes();
+  let absoluteTime = null;
+  let acc = 0;
+  for (const s of listA) {
+    const dur = s.trimOut - s.trimIn;
+    if (sequenceTimeOnA <= acc + dur || s === listA[listA.length - 1]) {
+      absoluteTime = s.trimIn + (sequenceTimeOnA - acc);
+      break;
+    }
+    acc += dur;
+  }
+  if (absoluteTime == null) return;
+
+  for (const trackId of ["B", "C"]) {
+    const videoEl = trackVideoEl(trackId);
+    if (!videoEl) continue;
+    const scene = orderedScenesBC(trackId).find(
+      s => s.enabled && absoluteTime >= s.trimIn && absoluteTime < s.trimOut
+    );
+    if (!scene) {
+      if (!videoEl.paused) videoEl.pause();
+      continue;
+    }
+    ensureVideoSourceBC(videoEl, scene).then(() => {
+      const target = absoluteTime;
+      if (Math.abs(videoEl.currentTime - target) > 0.3) videoEl.currentTime = target;
+      if (videoEl.paused) videoEl.play().catch(() => {});
+    });
+  }
 }
 
 function selectScene(id) {
@@ -946,6 +1104,70 @@ function watchSceneBoundary(videoEl, scene, { onFrame, onBoundary }) {
 
 let cancelBoundaryWatch = null;
 
+/* ---------------- Live audio-level meter ---------------- */
+
+// Lazily created on first playback (not at page load) so the AudioContext's
+// user-gesture requirement is satisfied by the same click that starts
+// playback, and so a page that never plays anything never pays for it.
+// createMediaElementSource may only be called once per <video> element ever
+// (same constraint documented at exportVideo's sourceNode/connectedEl), so
+// meterSourceVideo tracks which element is currently wired, matching the
+// export code's connectedEl pattern.
+let meterCtx = null;
+let meterAnalyser = null;
+let meterSourceVideo = null;
+let meterRAF = null;
+
+function ensureLevelMeter(mainVideo) {
+  if (meterSourceVideo === mainVideo) return;
+  if (!meterCtx) meterCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = meterCtx.createMediaElementSource(mainVideo);
+  meterAnalyser = meterCtx.createAnalyser();
+  meterAnalyser.fftSize = 256;
+  source.connect(meterAnalyser);
+  meterAnalyser.connect(meterCtx.destination); // pass-through, otherwise mainVideo goes silent
+  meterSourceVideo = mainVideo;
+}
+
+function startLevelMeterLoop() {
+  if (meterRAF) return;
+  const data = new Uint8Array(128);
+  const step = () => {
+    const canvas = document.getElementById("levelMeter");
+    if (canvas && meterAnalyser && state.isPlaying) {
+      meterAnalyser.getByteTimeDomainData(data);
+      let peak = 0;
+      for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128) / 128);
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#2a2f3a";
+      ctx.fillRect(0, 0, w, h);
+      const level = Math.min(1, peak * 1.8); // headroom so typical dialog isn't pinned at max
+      ctx.fillStyle = level > 0.85 ? "#ff5c5c" : "#4ade80";
+      ctx.fillRect(0, 0, w * level, h);
+    }
+    if (state.isPlaying) {
+      meterRAF = requestAnimationFrame(step);
+    } else {
+      meterRAF = null;
+    }
+  };
+  meterRAF = requestAnimationFrame(step);
+}
+
+// Sequence-time-within-track-A for whatever A is currently playing, used to
+// drive syncTracksBC -- same accumulation Timeline()'s playhead already does.
+function currentSequenceTimeOnA() {
+  const list = enabledOrderedScenes();
+  const scene = list[state.playingIndex];
+  const mainVideo = mainVideoEl();
+  if (!scene || !mainVideo) return null;
+  let acc = 0;
+  for (let i = 0; i < state.playingIndex; i++) acc += list[i].trimOut - list[i].trimIn;
+  return acc + Math.max(0, mainVideo.currentTime - scene.trimIn);
+}
+
 async function playCurrentSegment(startTime = null) {
   const list = enabledOrderedScenes();
   const scene = list[state.playingIndex];
@@ -955,6 +1177,13 @@ async function playCurrentSegment(startTime = null) {
   await ensureVideoSource(mainVideo, scene);
   if (!state.isPlaying) return; // stopped while the source was loading
   mainVideo.currentTime = startTime != null ? startTime : scene.trimIn;
+  try {
+    ensureLevelMeter(mainVideo);
+    startLevelMeterLoop();
+  } catch (e) {
+    // AudioContext creation/connection can fail in odd embedding contexts --
+    // the meter is a nice-to-have, never worth blocking playback over.
+  }
   mainVideo.play().catch(() => {
     // e.g. AbortError from a backgrounded tab's power-saving pause — surface as
     // stopped rather than leaving playback silently stuck mid-sequence.
@@ -964,7 +1193,11 @@ async function playCurrentSegment(startTime = null) {
 
   if (cancelBoundaryWatch) cancelBoundaryWatch();
   cancelBoundaryWatch = watchSceneBoundary(mainVideo, scene, {
-    onFrame: () => render(),
+    onFrame: () => {
+      const t = currentSequenceTimeOnA();
+      if (t != null) syncTracksBC(t);
+      render();
+    },
     onBoundary: () => {
       state.playingIndex++;
       if (state.playingIndex >= list.length) {
@@ -1004,7 +1237,11 @@ function seekToSequenceTime(seqTime) {
     });
     if (cancelBoundaryWatch) cancelBoundaryWatch();
     cancelBoundaryWatch = watchSceneBoundary(mainVideo, scene, {
-      onFrame: () => render(),
+      onFrame: () => {
+      const t = currentSequenceTimeOnA();
+      if (t != null) syncTracksBC(t);
+      render();
+    },
       onBoundary: () => {
         state.playingIndex++;
         if (state.playingIndex >= list.length) stopPlayback();
@@ -1046,6 +1283,10 @@ function stopPlayback() {
   if (cancelBoundaryWatch) { cancelBoundaryWatch(); cancelBoundaryWatch = null; }
   const mainVideo = mainVideoEl();
   if (mainVideo) mainVideo.pause();
+  for (const trackId of ["B", "C"]) {
+    const v = trackVideoEl(trackId);
+    if (v) v.pause();
+  }
   render();
 }
 
@@ -1421,15 +1662,15 @@ async function speechSplitEdit(sceneIds = null) {
 
 /* ---------------- Export / render to downloadable video ---------------- */
 
-function drawSceneFrame(ctx, video, scene, canvasW, canvasH) {
+function drawSceneFrame(ctx, video, scene, canvasW, canvasH, opaqueBackground = true) {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || !vh) return;
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, canvasW, canvasH);
+  if (opaqueBackground) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvasW, canvasH);
+  }
 
   const fit = scene.fit || "cover";
-  const canvasRatio = canvasW / canvasH;
-  const videoRatio = vw / vh;
 
   if (fit === "fill") {
     ctx.drawImage(video, 0, 0, vw, vh, 0, 0, canvasW, canvasH);
@@ -1444,6 +1685,43 @@ function drawSceneFrame(ctx, video, scene, canvasW, canvasH) {
   const drawW = vw * scale, drawH = vh * scale;
   const dx = (canvasW - drawW) / 2, dy = (canvasH - drawH) / 2;
   ctx.drawImage(video, 0, 0, vw, vh, dx, dy, drawW, drawH);
+}
+
+// Export-time equivalent of syncTracksBC/drawOverlayCanvas combined: for each
+// overlay track, finds whichever of that track's own enabled scenes covers
+// absoluteTime, seeks/plays that track's offscreen export video element to
+// match, connects its audio into the mix (once per element, same constraint
+// as track A's sourceNode/connectedEl), and draws its frame on top of
+// whatever track A already drew this tick. A track with nothing at this
+// position is paused and simply not drawn -- video/audio silently absent,
+// not an error.
+async function syncExportTracksBC(absoluteTime, exportVideoElBC, connectedElBC, gainNodeBC, audioCtx, ctx, canvasW, canvasH) {
+  for (const trackId of Object.keys(exportVideoElBC)) {
+    const el = exportVideoElBC[trackId];
+    const scene = orderedScenesBC(trackId).find(s => s.enabled && absoluteTime >= s.trimIn && absoluteTime < s.trimOut);
+    if (!scene) {
+      if (!el.paused) el.pause();
+      continue;
+    }
+    const src = state.sources.find(s => s.id === scene.sourceId);
+    if (!src) continue;
+
+    if (el.src !== src.url) {
+      el.src = src.url;
+      await new Promise((resolve) => { el.onloadedmetadata = resolve; });
+    }
+    if (!connectedElBC[trackId]) {
+      const node = audioCtx.createMediaElementSource(el);
+      node.connect(gainNodeBC[trackId]);
+      connectedElBC[trackId] = el;
+    }
+    gainNodeBC[trackId].gain.value = 1; // same untouched-original-level rule as track A
+
+    if (Math.abs(el.currentTime - absoluteTime) > 0.3) el.currentTime = absoluteTime;
+    if (el.paused) await el.play().catch(() => {});
+
+    if (el.videoWidth) drawSceneFrame(ctx, el, scene, canvasW, canvasH, false);
+  }
 }
 
 async function exportVideo() {
@@ -1468,6 +1746,19 @@ async function exportVideo() {
   exportVideoEl.playsInline = true;
   exportVideoEl.preload = "auto";
 
+  // One offscreen export element per overlay track, created only if that
+  // track actually has scenes -- an unused track costs nothing.
+  const exportVideoElBC = {};
+  for (const trackId of ["B", "C"]) {
+    if (orderedScenesBC(trackId).length) {
+      const el = document.createElement("video");
+      el.muted = false;
+      el.playsInline = true;
+      el.preload = "auto";
+      exportVideoElBC[trackId] = el;
+    }
+  }
+
   const FPS = 30;
   const canvasStream = canvas.captureStream(FPS);
 
@@ -1479,6 +1770,17 @@ async function exportVideo() {
   let connectedEl = null;
   const gainNode = audioCtx.createGain();
   gainNode.connect(audioDest);
+
+  // Same one-time-per-element MediaElementSource pattern as track A's
+  // sourceNode/connectedEl above, one gain node per overlay track so each
+  // can in principle be leveled independently (currently both left at 1,
+  // same "export uses untouched original level" rule as track A).
+  const connectedElBC = {};
+  const gainNodeBC = {};
+  for (const trackId of Object.keys(exportVideoElBC)) {
+    gainNodeBC[trackId] = audioCtx.createGain();
+    gainNodeBC[trackId].connect(audioDest);
+  }
 
   const mixedStream = new MediaStream([
     ...canvasStream.getVideoTracks(),
@@ -1539,9 +1841,11 @@ async function exportVideo() {
       // boundary logic left to drift out of sync.
       await new Promise((resolve) => {
         watchSceneBoundary(exportVideoEl, scene, {
-          onFrame: () => {
+          onFrame: async () => {
             drawSceneFrame(ctx, exportVideoEl, scene, canvasW, canvasH);
             const sceneElapsed = (performance.now() - sceneStart) / 1000;
+            const absoluteTime = scene.trimIn + Math.max(0, exportVideoEl.currentTime - scene.trimIn);
+            await syncExportTracksBC(absoluteTime, exportVideoElBC, connectedElBC, gainNodeBC, audioCtx, ctx, canvasW, canvasH);
             state.exportProgress = Math.min(99, Math.round(((elapsed + sceneElapsed) / totalDur) * 100));
             render();
           },
@@ -1557,6 +1861,7 @@ async function exportVideo() {
   } finally {
     recorder.stop();
     await finished;
+    for (const el of Object.values(exportVideoElBC)) el.pause();
     audioCtx.close();
   }
 
@@ -1740,6 +2045,8 @@ function SceneCard(scene, index) {
         <div class="dur">{fmt(dur)}</div>
       </div>
       <div class="actions">
+        <button title="Copy to track B" onclick={(e) => { e.stopPropagation(); copySceneToTrack(scene.id, "B"); }}>{"B"}</button>
+        <button title="Copy to track C" onclick={(e) => { e.stopPropagation(); copySceneToTrack(scene.id, "C"); }}>{"C"}</button>
         <button title={scene.enabled ? "Disable" : "Enable"} class={!scene.enabled ? "off" : ""}
           onclick={(e) => { e.stopPropagation(); toggleScene(scene.id); }}>
           {scene.enabled ? "✓" : "✕"}
@@ -1781,6 +2088,78 @@ function Timeline() {
       </div>
     </div>
   );
+}
+
+// Track A's own bar (unchanged behavior/state) labeled "A", plus lighter-
+// weight bars for the additive overlay tracks B/C. Kept as one dispatch
+// function rather than three near-identical renderers.
+function TimelineTrack(trackId) {
+  if (trackId === "A") {
+    return (
+      <div class="track-row">
+        <div class="track-label">A</div>
+        {Timeline()}
+      </div>
+    );
+  }
+
+  const list = orderedScenesBC(trackId);
+  const enabledList = list.filter(s => s.enabled);
+  const totalA = enabledOrderedScenes().reduce((a, s) => a + (s.trimOut - s.trimIn), 0) || 1;
+
+  return (
+    <div class="track-row">
+      <div class="track-label">{trackId}</div>
+      <div class="timeline-wrap">
+        <div class="timeline timeline-bc" onmousedown={(e) => beginTimelineScrubBC(e, trackId)}>
+          {enabledList.map(s => {
+            // Positioned along track A's absolute time axis (start relative to
+            // the overall sequence), not this track's own clip order, since B/C
+            // clips are meant to line up under whatever's on A at that time.
+            const left = (s.trimIn / totalA) * 100;
+            const w = ((s.trimOut - s.trimIn) / totalA) * 100;
+            return (
+              <div
+                class="seg seg-bc"
+                draggable="true"
+                ondragstart={(e) => { state.dragId = s.id; e.dataTransfer.effectAllowed = "move"; render(); }}
+                ondragend={() => { state.dragId = null; render(); }}
+                ondragover={(e) => e.preventDefault()}
+                ondrop={(e) => { e.preventDefault(); if (state.dragId != null) moveSceneBC(trackId, state.dragId, s.id); }}
+                style={`left:${left}%; width:${w}%; background:${colorFor(s.id)}`}
+                title={`Track ${trackId} clip`}
+              ></div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Lighter-weight version of beginTimelineScrub for B/C: scrubs THIS track's
+// video element to a position along track A's shared time axis, without
+// touching track A's own playingIndex/boundary-watch state.
+let timelineDraggingBC = false;
+function beginTimelineScrubBC(e, trackId) {
+  const track = e.currentTarget;
+  timelineDraggingBC = true;
+  const totalA = enabledOrderedScenes().reduce((a, s) => a + (s.trimOut - s.trimIn), 0) || 1;
+  const onMove = (ev) => {
+    if (!timelineDraggingBC) return;
+    const rect = track.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    syncTracksBC(pct * totalA);
+    render();
+  };
+  const onUp = () => {
+    timelineDraggingBC = false;
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  };
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  onMove(e);
 }
 
 const colorCache = {};
@@ -1951,14 +2330,20 @@ function App() {
             <video id="mainVideo"
               style={state.scenes.length ? "" : "display:none"}
             ></video>
+            <canvas id="overlayCanvas" class="overlay-canvas" style={state.scenes.length ? "" : "display:none"}></canvas>
+            <video id="trackVideoB" class="offscreen-track-video" playsinline preload="auto"></video>
+            <video id="trackVideoC" class="offscreen-track-video" playsinline preload="auto"></video>
             {!state.scenes.length && <div class="empty-hint">Load a video to begin scene detection.<br/>Scenes will appear in the stack on the left.</div>}
           </div>
           <div class="transport">
             <button class={state.isPlaying ? "" : "play"} onclick={togglePlay} title={state.isPlaying ? "Stop" : "Play sequence"} aria-label={state.isPlaying ? "Stop" : "Play sequence"}>
               {state.isPlaying ? "■" : "▶"}
             </button>
-            {Timeline()}
+            <canvas id="levelMeter" class="level-meter" title="Audio level"></canvas>
+            {TimelineTrack("A")}
           </div>
+          {TimelineTrack("B")}
+          {TimelineTrack("C")}
         </div>
 
         {TrimPanel()}
@@ -1994,6 +2379,31 @@ function render() {
   const tree = App();
   applyDiff(root, tree);
   syncActiveVideo();
+  drawOverlayCanvas();
+}
+
+// Draws whatever B/C video frames are currently loaded on top of mainVideo,
+// so overlay clips are visible during live preview and not just at export.
+// Sized/positioned to exactly cover mainVideo via CSS (position:absolute,
+// inset:0) rather than tracked in JS, so it self-corrects on any resize.
+function drawOverlayCanvas() {
+  const canvas = document.getElementById("overlayCanvas");
+  const mainVideo = mainVideoEl();
+  if (!canvas || !mainVideo || !mainVideo.videoWidth) return;
+  if (canvas.width !== mainVideo.videoWidth || canvas.height !== mainVideo.videoHeight) {
+    canvas.width = mainVideo.videoWidth;
+    canvas.height = mainVideo.videoHeight;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const trackId of ["B", "C"]) {
+    const v = trackVideoEl(trackId);
+    if (!v || v.paused || !v.videoWidth) continue;
+    const scale = Math.max(canvas.width / v.videoWidth, canvas.height / v.videoHeight); // cover fit
+    const drawW = v.videoWidth * scale, drawH = v.videoHeight * scale;
+    const dx = (canvas.width - drawW) / 2, dy = (canvas.height - drawH) / 2;
+    ctx.drawImage(v, 0, 0, v.videoWidth, v.videoHeight, dx, dy, drawW, drawH);
+  }
 }
 
 // Direct DOM write for the progress bar/status text during a detection
