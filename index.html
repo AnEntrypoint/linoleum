@@ -2071,15 +2071,26 @@ function SceneCard(scene, index) {
 function sharedPlayheadPct() {
   const list = orderedScenes();
   const total = list.reduce((a, s) => a + (s.enabled ? (s.trimOut - s.trimIn) : 0), 0) || 1;
+  const enabled = enabledOrderedScenes();
+  const mainVideo = mainVideoEl();
+
+  // While playing, position comes from state.playingIndex (the segment the
+  // boundary-watcher is actively stepping through). While paused/stopped --
+  // after a scrub or a scene selection parked mainVideo somewhere -- there is
+  // no playingIndex (-1), so fall back to wherever the ACTIVE scene is sitting
+  // instead of collapsing to 0, which is what made the line jump back to the
+  // left on every pause. Both branches share the same accumulate-then-offset
+  // shape; only which index/scene drives them differs.
+  const index = state.isPlaying
+    ? state.playingIndex
+    : enabled.findIndex(s => s.id === state.activeSceneId);
+  const cur = enabled[index];
+  if (!cur) return 0;
+
   let playedUpTo = 0;
-  if (state.isPlaying) {
-    const enabled = enabledOrderedScenes();
-    for (let i = 0; i < state.playingIndex; i++) {
-      playedUpTo += enabled[i].trimOut - enabled[i].trimIn;
-    }
-    const mainVideo = mainVideoEl();
-    const cur = enabled[state.playingIndex];
-    if (mainVideo && cur) playedUpTo += Math.max(0, mainVideo.currentTime - cur.trimIn);
+  for (let i = 0; i < index; i++) playedUpTo += enabled[i].trimOut - enabled[i].trimIn;
+  if (mainVideo && mainVideo.dataset.loadedSourceId === String(sourceFor(cur) && sourceFor(cur).id)) {
+    playedUpTo += Math.max(0, mainVideo.currentTime - cur.trimIn);
   }
   return Math.min(100, (playedUpTo / total) * 100);
 }
