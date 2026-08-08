@@ -1181,9 +1181,32 @@ async function playCurrentSegment(startTime = null) {
   const mainVideo = mainVideoEl();
   if (!scene || !mainVideo) { stopPlayback(); return; }
   state.activeSceneId = scene.id;
+
+  // Pause before touching src/currentTime for the next segment, same as
+  // export's exportVideoEl.pause() in onBoundary -- otherwise the previous
+  // segment can keep decoding/playing a sliver past its trimOut while this
+  // segment's source swap and seek are still in flight, which is what
+  // produced live playback's little overlap/stutter at scene boundaries
+  // that export (which always pauses first) never had.
+  mainVideo.pause();
   await ensureVideoSource(mainVideo, scene);
   if (!state.isPlaying) return; // stopped while the source was loading
-  mainVideo.currentTime = startTime != null ? startTime : scene.trimIn;
+
+  const target = startTime != null ? startTime : scene.trimIn;
+  mainVideo.currentTime = target;
+  // Await the seek landing before playing, same as export's
+  // `await new Promise(onseeked)` before `await exportVideoEl.play()` --
+  // without this, play() and watchSceneBoundary's rAF poll can both start
+  // while the element is still mid-seek, reading/showing a stale frame from
+  // the previous position (or previous source, if src was just swapped).
+  // Checked via .seeking (not currentTime equality) because a seek to a
+  // position the element already coalesces as "current" never fires
+  // 'seeked' in some browsers, which would hang this await forever.
+  if (mainVideo.seeking) {
+    await new Promise((resolve) => { mainVideo.onseeked = resolve; });
+    if (!state.isPlaying) return; // stopped while the seek was in flight
+  }
+
   try {
     ensureLevelMeter(mainVideo);
     startLevelMeterLoop();
@@ -1191,11 +1214,12 @@ async function playCurrentSegment(startTime = null) {
     // AudioContext creation/connection can fail in odd embedding contexts --
     // the meter is a nice-to-have, never worth blocking playback over.
   }
-  mainVideo.play().catch(() => {
+  await mainVideo.play().catch(() => {
     // e.g. AbortError from a backgrounded tab's power-saving pause — surface as
     // stopped rather than leaving playback silently stuck mid-sequence.
     if (state.isPlaying) stopPlayback();
   });
+  if (!state.isPlaying) return; // stopped while play() was settling
   render();
 
   if (cancelBoundaryWatch) cancelBoundaryWatch();
@@ -1206,6 +1230,7 @@ async function playCurrentSegment(startTime = null) {
       render();
     },
     onBoundary: () => {
+      mainVideo.pause();
       state.playingIndex++;
       if (state.playingIndex >= list.length) {
         stopPlayback();
