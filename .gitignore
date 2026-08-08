@@ -4,3 +4,5 @@
 .gm-test-assets/
 *.stackdump
 tune/
+config.bat
+node_modules
