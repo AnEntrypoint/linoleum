@@ -1351,6 +1351,13 @@ const SPEECH_MIN_GAP = 2 * SPEECH_PAD + 0.2;
 // Reject any input scene or detected speech region shorter than this outright
 // -- too short to be a meaningfully usable clip or to run detection on.
 const MIN_CLIP_LENGTH = 1.0;
+// Silence sub-ranges get their own, much smaller floor: a silence clip only
+// needs to exist and be visible in the stack (so the trimmed-away, non-speech
+// portion of a scene is never silently discarded), it doesn't need to be long
+// enough to comfortably watch/scrub the way a real speech clip does. Using
+// MIN_CLIP_LENGTH for silence too meant any sub-1s gap between speech regions
+// vanished entirely instead of appearing as its own speechless clip.
+const MIN_SILENCE_CLIP_LENGTH = 0.05;
 
 // Decode a source URL's full audio track once (mono, resampled to RNNoise's
 // required 44100Hz) and cache it — multiple scenes on the same source clip
@@ -1549,11 +1556,11 @@ function speechAndSilenceRanges(regions, rangeStart, rangeEnd) {
   const ranges = [];
   let cursor = rangeStart;
   for (const [s, e] of regions) {
-    if (s - cursor >= MIN_CLIP_LENGTH) ranges.push([cursor, s, true]);
+    if (s - cursor >= MIN_SILENCE_CLIP_LENGTH) ranges.push([cursor, s, true]);
     ranges.push([Math.max(cursor, s), e, false]);
     cursor = e;
   }
-  if (rangeEnd - cursor >= MIN_CLIP_LENGTH) ranges.push([cursor, rangeEnd, true]);
+  if (rangeEnd - cursor >= MIN_SILENCE_CLIP_LENGTH) ranges.push([cursor, rangeEnd, true]);
   return ranges;
 }
 
@@ -1629,7 +1636,8 @@ async function speechSplitEdit(sceneIds = null) {
     const ranges = speechAndSilenceRanges(regions, scene.trimIn, scene.trimOut);
 
     for (const [start, end, isSilence] of ranges) {
-      if (end - start < MIN_CLIP_LENGTH) continue; // sliver too short to be a usable clip
+      const floor = isSilence ? MIN_SILENCE_CLIP_LENGTH : MIN_CLIP_LENGTH;
+      if (end - start < floor) continue; // sliver too short even for its own (lower, for silence) floor
       newScenesBySlot.push({
         id: nextId(),
         sourceId: scene.sourceId,
