@@ -65,6 +65,9 @@
   .scene-card.dragover{border-color:var(--accent);}
   .scene-card.active{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset;}
   .scene-card.disabled{opacity:.4;}
+  .scene-card.silence{border-color:var(--danger); background:color-mix(in srgb, var(--danger) 14%, var(--panel2));}
+  .scene-card.silence.disabled{opacity:.35;}
+  .scene-card.silence .meta .idx{color:var(--danger);}
   .scene-card .thumb{
     width:56px; height:32px; border-radius:4px; background:#000 center/cover no-repeat;
     flex-shrink:0; border:1px solid var(--border);
@@ -950,7 +953,7 @@ function togglePlay() {
   }
 }
 
-/* ---------------- Speech Only: re-cut scenes to remove non-vocal silence ---------------- */
+/* ---------------- Speech split: re-cut scenes into speech/silence segments, keeping both ---------------- */
 
 // Gate: RNNoise VAD score below this counts as non-speech. Empirically tuned
 // against 5 real recordings spanning 6s-573s and mean levels -26.4dB to -12.5dB
@@ -1151,6 +1154,22 @@ async function findSpeechRegions(samples, rangeStart, rangeEnd, processor) {
   return final;
 }
 
+// Turns a scene's detected speech regions into an ordered list of
+// [start, end, isSilence] sub-ranges covering the WHOLE scene span, so the
+// caller never has to drop time -- gaps between/around speech regions become
+// their own silence sub-ranges instead of being discarded.
+function speechAndSilenceRanges(regions, rangeStart, rangeEnd) {
+  const ranges = [];
+  let cursor = rangeStart;
+  for (const [s, e] of regions) {
+    if (s - cursor >= MIN_CLIP_LENGTH) ranges.push([cursor, s, true]);
+    ranges.push([Math.max(cursor, s), e, false]);
+    cursor = e;
+  }
+  if (rangeEnd - cursor >= MIN_CLIP_LENGTH) ranges.push([cursor, rangeEnd, true]);
+  return ranges;
+}
+
 async function speechOnlyEdit(sceneIds = null) {
   const scenesToProcess = sceneIds
     ? orderedScenes().filter(s => sceneIds.includes(s.id) && s.enabled)
@@ -1175,6 +1194,7 @@ async function speechOnlyEdit(sceneIds = null) {
 
   const newScenesBySlot = [];
   const rejectedTooShortIds = new Set();
+  let silenceCount = 0;
 
   for (let idx = 0; idx < scenesToProcess.length; idx++) {
     const scene = scenesToProcess[idx];
@@ -1193,17 +1213,29 @@ async function speechOnlyEdit(sceneIds = null) {
     }
     const samples = await decodeSourceAudioMono44100(src);
     if (!samples) {
-      // No audio track at all on this clip — nothing to gate on, drop it
-      // (an entirely silent source has no speech by definition).
+      // No audio track at all on this clip -- the whole scene counts as silence,
+      // kept in the stack and highlighted rather than dropped.
+      newScenesBySlot.push({
+        id: nextId(),
+        sourceId: scene.sourceId,
+        start: scene.start,
+        end: scene.end,
+        trimIn: scene.trimIn,
+        trimOut: scene.trimOut,
+        enabled: true,
+        thumb: scene.thumb,
+        fit: scene.fit,
+        isSilence: true,
+      });
+      silenceCount++;
       continue;
     }
 
     const regions = await findSpeechRegions(samples, scene.trimIn, scene.trimOut, processor);
+    const ranges = speechAndSilenceRanges(regions, scene.trimIn, scene.trimOut);
 
-    for (const [regionStart, regionEnd] of regions) {
-      const start = Math.max(scene.trimIn, regionStart);
-      const end = Math.min(scene.trimOut, regionEnd);
-      if (end - start < MIN_CLIP_LENGTH) continue; // detected region too short to be a usable clip
+    for (const [start, end, isSilence] of ranges) {
+      if (end - start < MIN_CLIP_LENGTH) continue; // sliver too short to be a usable clip
       newScenesBySlot.push({
         id: nextId(),
         sourceId: scene.sourceId,
@@ -1214,7 +1246,9 @@ async function speechOnlyEdit(sceneIds = null) {
         enabled: true,
         thumb: scene.thumb,
         fit: scene.fit,
+        isSilence,
       });
+      if (isSilence) silenceCount++;
     }
   }
 
@@ -1247,9 +1281,10 @@ async function speechOnlyEdit(sceneIds = null) {
   const rejectedSuffix = rejectedTooShortIds.size
     ? ` (${rejectedTooShortIds.size} scene(s) skipped: shorter than ${MIN_CLIP_LENGTH}s)`
     : "";
+  const speechCount = newScenesBySlot.length - silenceCount;
   state.status = (newScenesBySlot.length
-    ? `Speech Only: ${scenesToProcess.length} scene(s) re-cut into ${newScenesBySlot.length} speech segment(s)`
-    : "Speech Only: no speech detected in any enabled scene") + rejectedSuffix;
+    ? `Split: ${scenesToProcess.length} scene(s) re-cut into ${speechCount} speech and ${silenceCount} silence segment(s)`
+    : "Split: no speech or silence detected in any enabled scene") + rejectedSuffix;
   render();
 }
 
@@ -1560,7 +1595,7 @@ function SceneCard(scene, index) {
   const src = sourceFor(scene);
   return (
     <div
-      class={`scene-card ${isActive ? "active" : ""} ${!scene.enabled ? "disabled" : ""} ${state.dragId === scene.id ? "dragging" : ""}`}
+      class={`scene-card ${isActive ? "active" : ""} ${!scene.enabled ? "disabled" : ""} ${scene.isSilence ? "silence" : ""} ${state.dragId === scene.id ? "dragging" : ""}`}
       draggable="true"
       onclick={() => selectScene(scene.id)}
       ondragstart={(e) => { state.dragId = scene.id; e.dataTransfer.effectAllowed = "move"; render(); }}
@@ -1570,7 +1605,7 @@ function SceneCard(scene, index) {
     >
       <div class="thumb" style={scene.thumb ? `background-image:url(${scene.thumb})` : ""}></div>
       <div class="meta">
-        <div class="idx">Scene {index + 1}{state.sources.length > 1 && src ? ` · ${src.name}` : ""}</div>
+        <div class="idx">Scene {index + 1}{state.sources.length > 1 && src ? ` · ${src.name}` : ""}{scene.isSilence ? " · silence" : ""}</div>
         <div class="dur">{fmt(dur)}</div>
       </div>
       <div class="actions">
@@ -1746,10 +1781,10 @@ function App() {
           <span>drag more clips in to append them to the stack</span>
         </div>
         <div class="sep"></div>
-        <button class="speech-btn" title="Re-cut all clips to remove non-vocal silence (RNNoise, gated at -14dB)"
+        <button class="speech-btn" title="Split all clips into speech and silence segments (RNNoise VAD) — silence stays in the stack, highlighted red"
           disabled={!list.filter(s => s.enabled).length || state.speechScanning || state.exporting}
           onclick={() => speechOnlyEdit()}>
-          {state.speechScanning ? `Screening... ${state.speechScanProgress}%` : "Speech Only"}
+          {state.speechScanning ? `Screening... ${state.speechScanProgress}%` : "Mark Speech"}
         </button>
         <div class="sep"></div>
         <select class="ratio-select" title="Output canvas ratio" disabled={state.exporting} onchange={(e) => { state.canvasRatio = e.target.value; render(); }}>
@@ -1814,8 +1849,8 @@ function ImportModeModal() {
             <div class="modal-option-desc">Auto-detect cuts and break the clip into scenes.</div>
           </button>
           <button class="modal-option" onclick={() => resolvePendingImport("split-speech")}>
-            <div class="modal-option-title">Split + Speech Only</div>
-            <div class="modal-option-desc">Auto-detect cuts, then trim each scene to just the speech.</div>
+            <div class="modal-option-title">Split + Mark Speech</div>
+            <div class="modal-option-desc">Auto-detect cuts, then split each scene into speech and silence segments — silence stays in the stack, highlighted red.</div>
           </button>
         </div>
       </div>
