@@ -240,6 +240,62 @@ const state = {
   pendingImport: null, // {kind: 'file'|'url', file, url, name} — awaiting an import-mode choice
 };
 
+/* ---------------- Undo/redo: 50-step history over {scenes, order, activeSceneId} ---------------- */
+
+const HISTORY_LIMIT = 50;
+// history[historyIndex] is always the snapshot matching the CURRENT state.
+// Undo moves historyIndex back and restores; redo moves it forward and restores.
+// Sources/blob URLs are never part of a snapshot (undo only reorders/edits/removes
+// scenes referencing them, it never needs to recreate a source), and scene objects
+// are deep-cloned so a later in-place mutation (e.g. a trim drag) can't reach back
+// and corrupt an already-pushed snapshot.
+const history = [];
+let historyIndex = -1;
+let lastSnapshotJSON = null;
+let restoringHistory = false; // true while applying an undo/redo, so it isn't re-captured as a new step
+
+function snapshotUndoSlice() {
+  return { scenes: state.scenes, order: state.order, activeSceneId: state.activeSceneId };
+}
+
+function captureHistoryIfChanged() {
+  if (restoringHistory || state.trimDragHandle) return; // mid-drag frames coalesce into one step at drag end
+  const snap = snapshotUndoSlice();
+  const json = JSON.stringify(snap);
+  if (json === lastSnapshotJSON) return;
+  const cloned = JSON.parse(json);
+  history.splice(historyIndex + 1); // discard any redo-forward branch
+  history.push(cloned);
+  if (history.length > HISTORY_LIMIT) history.shift();
+  historyIndex = history.length - 1;
+  lastSnapshotJSON = json;
+}
+
+function canUndo() { return historyIndex > 0; }
+function canRedo() { return historyIndex >= 0 && historyIndex < history.length - 1; }
+
+function applyHistorySnapshot(snap) {
+  restoringHistory = true;
+  state.scenes = JSON.parse(JSON.stringify(snap.scenes));
+  state.order = snap.order.slice();
+  state.activeSceneId = snap.activeSceneId;
+  lastSnapshotJSON = JSON.stringify(snap);
+  render();
+  restoringHistory = false;
+}
+
+function undo() {
+  if (!canUndo()) return;
+  historyIndex--;
+  applyHistorySnapshot(history[historyIndex]);
+}
+
+function redo() {
+  if (!canRedo()) return;
+  historyIndex++;
+  applyHistorySnapshot(history[historyIndex]);
+}
+
 function canvasRatioValue() {
   const r = CANVAS_RATIOS.find(r => r.id === state.canvasRatio) || CANVAS_RATIOS[0];
   return r.w / r.h;
@@ -1781,6 +1837,9 @@ function App() {
           <span>drag more clips in to append them to the stack</span>
         </div>
         <div class="sep"></div>
+        <button title="Undo (Ctrl+Z)" disabled={!canUndo()} onclick={() => undo()}>{"Undo"}</button>
+        <button title="Redo (Ctrl+Y)" disabled={!canRedo()} onclick={() => redo()}>{"Redo"}</button>
+        <div class="sep"></div>
         <button class="speech-btn" title="Split all clips into speech and silence segments (RNNoise VAD) — silence stays in the stack, highlighted red"
           disabled={!list.filter(s => s.enabled).length || state.speechScanning || state.exporting}
           onclick={() => speechOnlyEdit()}>
@@ -1861,6 +1920,7 @@ function ImportModeModal() {
 const root = document.getElementById("app");
 
 function render() {
+  captureHistoryIfChanged();
   const tree = App();
   applyDiff(root, tree);
   syncActiveVideo();
@@ -1890,6 +1950,26 @@ function syncActiveVideo() {
   if (!src || (mainVideo.dataset.loadedSourceId === String(src.id) && mainVideo.src)) return;
   ensureVideoSource(mainVideo, scene).then(() => { mainVideo.currentTime = scene.trimIn; });
 }
+
+// Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z as the common redo alt) for undo/redo.
+// Skipped while focus is in a text input (the URL field) so typing "z" or "y"
+// there isn't hijacked into a history jump.
+window.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  const key = e.key.toLowerCase();
+  if (key === "z" && e.shiftKey) {
+    e.preventDefault();
+    redo();
+  } else if (key === "z") {
+    e.preventDefault();
+    undo();
+  } else if (key === "y") {
+    e.preventDefault();
+    redo();
+  }
+});
 
 // page-level drag styling
 window.addEventListener("dragover", (e) => { e.preventDefault(); state.dragOverPage = true; });
